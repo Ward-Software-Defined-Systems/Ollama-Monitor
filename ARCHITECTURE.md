@@ -129,11 +129,14 @@ Sessions are stamped on app start (`started_at`); `ended_at` is filled on gracef
 
 ## Pricing
 
-[`pricing.toml`](./pricing.toml) is `include_str!`-baked at compile time. Three frontier model keys:
+[`pricing.toml`](./pricing.toml) is `include_str!`-baked at compile time. Six frontier model keys:
 
 ```rust
 pub const FRONTIER_MODELS: &[&str] = &[
+    "claude-fable-5-1",
     "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-opus-5",
     "claude-opus-4-8",
     "gemini-3-1-pro",
 ];

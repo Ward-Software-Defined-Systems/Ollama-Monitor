@@ -5,9 +5,21 @@
 #   input_per_mtok_usd  = 4.00
 #   output_per_mtok_usd = 20.00
 
+[providers.anthropic.models.claude-fable-5-1]
+input_per_mtok_usd  = 10.00
+output_per_mtok_usd = 50.00
+
 [providers.anthropic.models.claude-fable-5]
 input_per_mtok_usd  = 10.00
 output_per_mtok_usd = 50.00
+
+[providers.anthropic.models.claude-opus-5-5]
+input_per_mtok_usd  = 4.00
+output_per_mtok_usd = 20.00
+
+[providers.anthropic.models.claude-opus-5]
+input_per_mtok_usd  = 5.00
+output_per_mtok_usd = 25.00
 
 [providers.anthropic.models.claude-opus-4-8]
 input_per_mtok_usd  = 5.00

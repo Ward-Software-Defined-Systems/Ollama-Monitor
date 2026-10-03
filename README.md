@@ -5,7 +5,7 @@ A standalone Rust TUI that observes [Ollama](https://ollama.com) inference activ
 - **Models** — every installed model (local and `:cloud`) with its state (loaded / cloud / not-loaded); `▸` marks the last request's target
 - **Live request feed** — last 30 completed inferences (timestamp, model, prompt/gen tokens, TTFT, tok/s, stop reason)
 - **Rolling throughput** — 1m / 5m / 15m / session-lifetime windows
-- **Hypothetical frontier cost** — Claude Fable 5, Opus 4.8, Gemini 3.1 Pro priced against local token counts
+- **Hypothetical frontier cost** — Claude Fable 5.1, Fable 5, Opus 5.5, Opus 5, Opus 4.8, Gemini 3.1 Pro priced against local token counts
 - **Hardware** — system + Ollama process tree CPU%, memory, GPU active residency, ANE power
 - **Cross-session SQLite persistence** — lifetime totals available across restarts
 
