@@ -128,6 +128,10 @@ async fn async_main(
     });
 
     if cli.no_tui {
+        // Headless has no models/hardware panels; drop the receivers so the poller and
+        // sampler exit on their next send instead of blocking on a full channel.
+        drop(models_rx);
+        drop(hw_rx);
         run_headless(records_rx, db_handle.clone(), shutdown_rx.clone()).await?;
     } else {
         tui::run(
@@ -137,6 +141,7 @@ async fn async_main(
             hw_rx,
             db_handle.clone(),
             pricing.clone(),
+            cli.ollama_url.clone(),
             cli.proxy_listen.clone(),
             shutdown_tx.clone(),
             shutdown_rx.clone(),
@@ -178,7 +183,7 @@ async fn run_headless(
                 let p = if approx { "~" } else { "" };
                 eprintln!(
                     "[{}] {} | prompt={} gen={}{} tok/s={}{:.1} ttft={:.2}s total={:.2}s ({}{})",
-                    record.completed_at.format("%H:%M:%S"),
+                    record.completed_at.with_timezone(&chrono::Local).format("%H:%M:%S"),
                     record.model_id,
                     record.prompt_tokens,
                     p,

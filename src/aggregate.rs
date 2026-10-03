@@ -10,6 +10,7 @@ pub struct WindowStats {
     pub prompt_tokens: u64,
     pub gen_tokens: u64,
     pub mean_tps: f64,
+    #[allow(dead_code)] // computed for parity with LMS-Monitor; the rolling panel shows mean + p95
     pub p50_tps: f64,
     pub p95_tps: f64,
     pub mean_ttft_sec: f64,

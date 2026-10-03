@@ -42,7 +42,7 @@ One OS process, one `tokio` multi-thread runtime. Tasks communicate through boun
 | file | role |
 |---|---|
 | `src/main.rs` | CLI parse, runtime bootstrap, channel + task wiring, signal handling, TUI vs headless dispatch |
-| `src/api.rs` | `GET /api/version`, `/api/tags`, `/api/ps` clients; `poll_models` task; `ModelsSnapshot::{Loaded, Unreachable}` |
+| `src/api.rs` | `poll_models` task: `GET /api/version`, then `/api/tags` + `/api/ps` concurrently; `merge_models` turns them into LMS-shaped `ModelInfo` rows (state loaded / cloud / not-loaded); `resolve_model_id` maps a record's model name to its row for the `▸` marker; `ModelsSnapshot::{Loaded, Unreachable}` |
 | `src/proxy.rs` | axum reverse proxy. Transparent forwarder for all paths. For inference paths it tees the response stream into a per-request `parser::Accumulator`. |
 | `src/parser.rs` | Per-request stats accumulator. Detects envelope from path + content-type, drains NDJSON / SSE frames as they arrive, emits `ParsedStats` on `finalize()`. |
 | `src/aggregate.rs` | Rolling 1m / 5m / 15m / session-lifetime windows; per-model breakdown; mean / p50 / p95 |
@@ -50,9 +50,9 @@ One OS process, one `tokio` multi-thread runtime. Tasks communicate through boun
 | `src/db.rs` | SQLite schema + sessions + dedicated tokio writer task; `lifetime_totals` query |
 | `src/config.rs` | Optional user TOML loader; macOS app-support path resolution for db / config / log |
 | `src/hardware.rs` | `sysinfo` CPU/MEM sampler + `sudo powermetrics` GPU/ANE parser; Ollama-tree process detection |
-| `src/tui/mod.rs` | Event loop; `AppState`; render dispatcher; panic-safe terminal restore |
-| `src/tui/layout.rs` | Top-to-bottom panel layout |
-| `src/tui/widgets.rs` | Per-panel render fns (header, models, hardware, feed, rolling, costs, footer) |
+| `src/tui/mod.rs` | Event loop; `AppState`; `render()`; panic-safe terminal restore |
+| `src/tui/layout.rs` | Top-to-bottom panel layout — byte-identical to LMS-Monitor's |
+| `src/tui/widgets.rs` | Per-panel render fns (header, models, hardware, feed, rolling, costs, footer), ported from LMS-Monitor |
 
 ## Event source — the design pivot
 
@@ -162,21 +162,27 @@ On shutdown, the powermetrics child receives `SIGTERM` via `libc::kill` so it ex
 
 The `cpu_power` sampler is included alongside `ane_power` because on M1/M4 Macs the unified power summary that includes the `ANE Power:` line only emits when `cpu_power` is requested.
 
+`sysinfo` is pinned to the same 0.38 line as LMS-Monitor so both TUIs report identical memory figures. "free" is XNU's available-non-compressed memory (active + inactive + free); 0.32 subtracted compressor pages instead and floored at 0 under heavy compression.
+
 ## TUI
 
-`ratatui` 0.30 + `crossterm` 0.29. Top-to-bottom layout (heights chosen to fit ~120×40):
+`ratatui` 0.30 + `crossterm` 0.29. A port of LMS-Monitor's TUI: same layout (heights fit 120×36 minimum), columns, colours and keys. Top-to-bottom:
 
 | panel | rows | widget |
 |---|---|---|
-| header | 3 | ollama status, version, lifetime totals, proxy chip, session-request count, paused flag, clock |
-| loaded models | 6 | id · family · params · quant · ctx · vram · expires (from `/api/ps`) |
-| hardware | 4 | system CPU/MEM line, Ollama CPU/RSS/proc count + GPU/ANE line |
-| live feed | `Min(7)` | last 30 records, newest at top — table grows on tall terminals |
-| rolling metrics | 9 | `1m / 5m / 15m / session` columns; rows = req count, prompt tok, gen tok, mean tps, p50 tps, p95 tps, mean TTFT |
-| hypothetical cost | 7 | per-frontier-model session-cumulative input / output / total USD |
+| header | 3 | `ollama-monitor · server: ● reachable/unreachable/unknown (url) · err · [PAUSED] · lifetime: reqs / sessions / prompt tok / gen tok · local clock`; Ollama-only `ollama vX · proxy ADDR` right-aligned in the top border |
+| loaded models | 6 | every `/api/tags` model merged with `/api/ps`: id · type · compat · quant · ctx · state (`loaded` / `cloud` / `not-loaded`), `▸` on the most recent inference target |
+| hardware | 3 | one line: system CPU/MEM (free) │ Ollama CPU/RSS/proc count │ GPU/ANE |
+| live feed | `Min(7)` | last 30 records, newest at top: local completion time · model · prompt · gen · TTFT ms · tok/s · stop; `~` marks approximate (`openai-sse-approx`) rows |
+| rolling metrics | 9 | `1m / 5m / 15m / session` columns; rows = requests, prompt tok, gen tok, mean tok/s, p95 tok/s, mean TTFT |
+| hypothetical cost | 7 | frontier models as columns; input / output / total USD rows for the session |
 | footer | 1 | `q quit · r reset session · p pause` |
 
-Render tick: 250 ms. Channel reads non-blocking via `tokio::select!`. Input events arrive from a dedicated blocking thread (sync `crossterm::event::read` → mpsc → main loop).
+Feed time is completion time (LMS-Monitor shows start time) because Ollama-Monitor's rolling windows, DB rows and feed order are all keyed on `completed_at`.
+
+The `▸` marker needs name normalisation: OpenAI-compatible responses report `deepseek-v4-pro` for the `deepseek-v4-pro:cloud` tag, and `qwen3` for `qwen3:latest`. `api::canonical_model_name` strips `:latest`, `:cloud` and `-cloud`; an exact id match always wins over a canonical one.
+
+Redraw happens after every event (records, polls, keys, resize) plus a 250 ms tick for the clock. Channel reads via `tokio::select!` (biased: shutdown, keys, records first). Input arrives from a dedicated blocking thread (`crossterm::event::poll` 250 ms + `read` → mpsc); only key presses act.
 
 Terminal restore is bracketed by:
 
@@ -189,6 +195,7 @@ Terminal restore is bracketed by:
 ## Notable invariants
 
 - Every record in `inference_records` ⇔ one TUI feed entry ⇔ one aggregator ingest. The TUI is the sole tee point — no double-counting.
+- TUI parity with LMS-Monitor: `tui/layout.rs` is byte-identical; `tui/widgets.rs` differs only in data-model mapping plus the Ollama extras (version/proxy border title, `cloud` state, `~` markers). Change both apps together.
 - The proxy is the only path through which records are captured. Direct hits to upstream `:11434` are intentionally invisible.
 - Proxy parser failures never affect proxy correctness — clients always see exactly what Ollama returned. (Exception: the OpenAI-compat request-body rewrite described above; clients never see *less* than they would have, and the upstream response is forwarded byte-for-byte.)
 - Pricing keys are TOML-friendly (hyphenated, no dots): `gemini-3-1-pro`, not `gemini-3.1-pro`. Mismatch = silent miss.

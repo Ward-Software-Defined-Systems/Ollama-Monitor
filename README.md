@@ -2,6 +2,7 @@
 
 A standalone Rust TUI that observes [Ollama](https://ollama.com) inference activity on `localhost` via a transparent reverse proxy and surfaces:
 
+- **Models** — every installed model (local and `:cloud`) with its state (loaded / cloud / not-loaded); `▸` marks the last request's target
 - **Live request feed** — last 30 completed inferences (timestamp, model, prompt/gen tokens, TTFT, tok/s, stop reason)
 - **Rolling throughput** — 1m / 5m / 15m / session-lifetime windows
 - **Hypothetical frontier cost** — Claude Fable 5, Opus 4.8, Gemini 3.1 Pro priced against local token counts
@@ -35,7 +36,7 @@ Requests that bypass the proxy (direct hits on `:11434`) are not captured — by
 
 ## Status
 
-v0.1.0. Built on top of an existing LM Studio monitor architecture; replaces the `lms log stream` event source with the reverse proxy.
+v0.1.0. Built on top of an existing LM Studio monitor architecture; replaces the `lms log stream` event source with the reverse proxy. The TUI is a port of LMS-Monitor's — same panels, columns and keys — so the two can run side by side.
 
 ## Requirements
 
@@ -59,6 +60,8 @@ target/release/ollama-monitor
 
 You'll be prompted for your sudo password — used solely to spawn `powermetrics --samplers cpu_power,gpu_power,ane_power -i 2000`. The TUI then opens.
 
+Run it as your normal user, not under `sudo`: the app asks for elevation only for powermetrics, so the proxy (which may be network-facing) never runs as root.
+
 If you'd rather skip GPU/ANE and avoid the prompt, use headless mode:
 
 ```sh
@@ -79,7 +82,7 @@ curl http://localhost:11434/api/chat -d '{"model":"qwen3:14b", ...}'
 curl http://localhost:11435/api/chat -d '{"model":"qwen3:14b", ...}'
 ```
 
-For network-accessible monitoring (other machines hitting this Mac Mini), bind the proxy on `0.0.0.0`:
+For network-accessible monitoring (other machines or VMs hitting this Mac), bind the proxy on `0.0.0.0`:
 
 ```sh
 ollama-monitor --proxy-listen 0.0.0.0:11435
@@ -136,7 +139,8 @@ If a request still goes unrecorded, the monitor logs `no parsable stats in respo
 
 | symptom | check |
 |---|---|
-| header shows "● unreachable" | `curl http://localhost:11434/api/version` — is `ollama serve` actually running? |
+| header shows "server: ● unreachable" | `curl http://localhost:11434/api/version` — is `ollama serve` actually running? The `err:` text after it names the failing endpoint |
+| exits at startup with "Permission denied" on the log or DB | the app-support dir is root-owned from an earlier `sudo` launch: `sudo chown -R "$USER":staff ~/Library/Application\ Support/ollama-monitor`, then run without sudo |
 | GPU or ANE shows `n/a` | `OLLAMA_MONITOR_LOG=trace` then grep `powermetrics` in the log — the parser tolerates label variants but isn't psychic |
 | no records appear despite traffic | clients still pointed at `:11434` instead of `:11435` — verify with `curl http://localhost:11435/api/version` (should return Ollama's version) |
 | sudo prompt fails / app exits | `sudo -v` once before launch, or use `--no-tui` |
@@ -144,7 +148,9 @@ If a request still goes unrecorded, the monitor logs `no parsable stats in respo
 ## Development
 
 ```sh
-cargo test                # unit + fixture tests for parser, aggregator, pricing, db, hardware
+cargo test                # unit + fixture tests: parser, proxy, api merge, aggregator, pricing, db, hardware, TUI render
+cargo test screen_snapshot -- --nocapture         # print the TUI at 120x36 and 160x44 from fixtures
+cargo test live_ollama -- --ignored --nocapture   # render the models panel from the real local Ollama (read-only)
 cargo run -- --help
 ```
 

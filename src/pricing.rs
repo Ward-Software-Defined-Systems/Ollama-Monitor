@@ -71,3 +71,43 @@ pub fn load(user: Option<&UserConfig>) -> Arc<PricingTable> {
 
     Arc::new(PricingTable { by_model })
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HypotheticalCost {
+    pub input_usd: f64,
+    pub output_usd: f64,
+    pub total_usd: f64,
+}
+
+pub fn hypothetical_cost(prompt_tokens: u64, gen_tokens: u64, price: &ModelPricing) -> HypotheticalCost {
+    let input_usd = prompt_tokens as f64 / 1_000_000.0 * price.input_per_mtok_usd;
+    let output_usd = gen_tokens as f64 / 1_000_000.0 * price.output_per_mtok_usd;
+    HypotheticalCost {
+        input_usd,
+        output_usd,
+        total_usd: input_usd + output_usd,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_have_all_frontier_models() {
+        let table = load(None);
+        for key in FRONTIER_MODELS {
+            assert!(table.get(key).is_some(), "frontier model {key} missing from defaults");
+        }
+    }
+
+    #[test]
+    fn one_million_in_one_million_out_matches_rates() {
+        let table = load(None);
+        let opus = table.get("claude-opus-4-8").unwrap();
+        let cost = hypothetical_cost(1_000_000, 1_000_000, &opus);
+        assert_eq!(cost.input_usd, 5.00);
+        assert_eq!(cost.output_usd, 25.00);
+        assert_eq!(cost.total_usd, 30.00);
+    }
+}

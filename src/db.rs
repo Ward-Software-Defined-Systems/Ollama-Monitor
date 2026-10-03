@@ -24,6 +24,7 @@ pub struct InferenceRecord {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LifetimeTotals {
+    pub session_count: u64,
     pub total_requests: u64,
     pub total_prompt_tokens: u64,
     pub total_gen_tokens: u64,
@@ -128,14 +129,16 @@ pub async fn open_and_spawn_writer(
 
 pub fn lifetime_totals(reader: &Connection) -> Result<LifetimeTotals> {
     let mut stmt = reader.prepare(
-        "SELECT COALESCE(COUNT(*), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(gen_tokens), 0) \
+        "SELECT (SELECT COUNT(*) FROM sessions), \
+                COALESCE(COUNT(*), 0), COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(gen_tokens), 0) \
          FROM inference_records",
     )?;
     let totals = stmt.query_row([], |row| {
         Ok(LifetimeTotals {
-            total_requests: row.get::<_, i64>(0)? as u64,
-            total_prompt_tokens: row.get::<_, i64>(1)? as u64,
-            total_gen_tokens: row.get::<_, i64>(2)? as u64,
+            session_count: row.get::<_, i64>(0)? as u64,
+            total_requests: row.get::<_, i64>(1)? as u64,
+            total_prompt_tokens: row.get::<_, i64>(2)? as u64,
+            total_gen_tokens: row.get::<_, i64>(3)? as u64,
         })
     })?;
     Ok(totals)
@@ -276,10 +279,25 @@ mod tests {
         insert_record(&conn, &rec).unwrap();
         insert_record(&conn, &rec).unwrap();
         let totals = lifetime_totals(&conn).unwrap();
+        assert_eq!(totals.session_count, 1);
         assert_eq!(totals.total_requests, 2);
         assert_eq!(totals.total_prompt_tokens, 24);
         assert_eq!(totals.total_gen_tokens, 176);
         close_session(&conn, session_id).unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lifetime_counts_sessions_without_records() {
+        let path = temp_db_path();
+        let conn = open_and_migrate(&path).unwrap();
+        for _ in 0..3 {
+            insert_session(&conn).unwrap();
+        }
+        let totals = lifetime_totals(&conn).unwrap();
+        assert_eq!(totals.session_count, 3);
+        assert_eq!(totals.total_requests, 0);
+        assert_eq!(totals.total_prompt_tokens, 0);
         let _ = std::fs::remove_file(&path);
     }
 }
