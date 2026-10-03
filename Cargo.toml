@@ -1,0 +1,68 @@
+[package]
+name = "ollama-monitor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Passive observer for a local Ollama instance: live request feed, rolling tok/s, hypothetical frontier-API cost, and hardware telemetry in a TUI."
+license = "MIT"
+
+[[bin]]
+name = "ollama-monitor"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP — reverse proxy
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "macros"] }
+hyper = { version = "1", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "server-auto"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+tower = "0.5"
+bytes = "1"
+futures-util = "0.3"
+tokio-stream = "0.1"
+
+# HTTP client (poller + proxy upstream)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# system
+sysinfo = "0.32"
+libc = "0.2"
+
+# serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# error / utilities
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
