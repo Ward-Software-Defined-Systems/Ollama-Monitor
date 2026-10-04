@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::backend::CrosstermBackend;
+use ratatui::{DefaultTerminal, Frame, Terminal};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, interval};
 use tracing::{debug, info, warn};
@@ -157,7 +158,7 @@ pub async fn run(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     install_panic_hook();
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal()?;
 
     let mut state = AppState::new(session_id, base_url, proxy_listen, pricing);
 
@@ -187,7 +188,7 @@ pub async fn run(
     )
     .await;
 
-    ratatui::restore();
+    restore_terminal();
     info!("tui exited");
     result
 }
@@ -210,7 +211,13 @@ async fn run_loop(
         // Redraw after every event (as LMS-Monitor does), not just on the tick, so a busy
         // record stream can't starve the screen; the tick keeps the clock moving.
         state.now = Utc::now();
-        terminal.draw(|f| render(f, state)).context("draw")?;
+        if let Err(err) = terminal.draw(|f| render(f, state)) {
+            // After a SIGHUP the terminal is gone; that's a shutdown, not a failure.
+            if *shutdown_rx.borrow() {
+                return Ok(());
+            }
+            return Err(err).context("draw");
+        }
 
         tokio::select! {
             biased;
@@ -269,9 +276,30 @@ fn handle_input(event: Event, state: &mut AppState, shutdown_tx: &watch::Sender<
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        restore_terminal();
         original(info);
     }));
+}
+
+/// Raw mode + alternate screen: what `ratatui::try_init` does, minus its panic hook. That
+/// hook calls `ratatui::restore()`, whose `eprintln!` panics once a SIGHUP has taken the
+/// terminal away, and a panic inside the panic hook aborts the process.
+fn init_terminal() -> Result<DefaultTerminal> {
+    use ratatui::crossterm::{execute, terminal};
+    terminal::enable_raw_mode().context("enable raw mode")?;
+    let terminal = execute!(std::io::stdout(), terminal::EnterAlternateScreen)
+        .and_then(|()| Terminal::new(CrosstermBackend::new(std::io::stdout())));
+    if terminal.is_err() {
+        restore_terminal();
+    }
+    terminal.context("set up terminal")
+}
+
+/// Best effort and silent: after a SIGHUP there is no terminal left and every step fails.
+fn restore_terminal() {
+    if let Err(err) = ratatui::try_restore() {
+        debug!(error = %err, "terminal restore failed (terminal gone?)");
+    }
 }
 
 fn spawn_input_thread(tx: mpsc::Sender<Event>, shutdown_rx: watch::Receiver<bool>) {

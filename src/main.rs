@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -116,20 +117,25 @@ async fn async_main(
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        info!("signal handlers installed (SIGTERM, SIGINT)");
+        // Closing the terminal window sends SIGHUP; shut down cleanly instead of dying.
+        let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        info!("signal handlers installed (SIGTERM, SIGINT, SIGHUP)");
         tokio::select! {
             _ = sigterm.recv() => info!("SIGTERM received"),
             _ = sigint.recv() => info!("SIGINT received"),
+            _ = sighup.recv() => info!("SIGHUP received (terminal closed)"),
         }
         if let Err(err) = shutdown_for_signals.send(true) {
             tracing::warn!(error = %err, "failed to broadcast shutdown");
         }
     });
 
-    if cli.no_tui {
+    // No `?` on the UI: even when it fails, workers still get shut down and the session
+    // row still gets its ended_at.
+    let ui_result = if cli.no_tui {
         // Headless has no models or hardware panels, so the poller and the sampler (with
         // its sudo powermetrics) never start.
-        run_headless(records_rx, db_handle.clone(), shutdown_rx.clone()).await?;
+        run_headless(records_rx, db_handle.clone(), shutdown_rx.clone()).await
     } else {
         let (models_tx, models_rx) = mpsc::channel::<ModelsSnapshot>(8);
         let (hw_tx, hw_rx) = mpsc::channel::<HardwareSnapshot>(8);
@@ -151,7 +157,10 @@ async fn async_main(
             shutdown_tx.clone(),
             shutdown_rx.clone(),
         )
-        .await?;
+        .await
+    };
+    if let Err(err) = &ui_result {
+        tracing::error!("ui failed: {err:#}");
     }
 
     info!("ui exited; broadcasting shutdown to workers");
@@ -170,7 +179,7 @@ async fn async_main(
     }
     db_handle.end_session(session_id).await?;
     info!("shutdown complete");
-    Ok(())
+    ui_result
 }
 
 async fn run_headless(
@@ -189,7 +198,10 @@ async fn run_headless(
                 // ~ prefixes flag approximate captures from the cloud fallback path.
                 let approx = record.envelope == "openai-sse-approx";
                 let p = if approx { "~" } else { "" };
-                eprintln!(
+                // writeln!, not eprintln!: once a SIGHUP has taken the terminal away,
+                // eprintln! would panic on the failed write.
+                let _ = writeln!(
+                    std::io::stderr(),
                     "[{}] {} | prompt={} gen={}{} tok/s={}{:.1} ttft={:.2}s total={:.2}s ({}{})",
                     record.completed_at.with_timezone(&chrono::Local).format("%H:%M:%S"),
                     record.model_id,

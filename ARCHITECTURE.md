@@ -29,7 +29,7 @@ clients ──HTTP──▶ proxy (axum) ──reqwest──▶ Ollama
 shutdown: watch<bool> reaches every task; q / Ctrl-C / SIGINT / SIGTERM set it
 ```
 
-`main` spawns the proxy, the signal task and, in TUI mode, the model poller and the hardware sampler. `tui::run` spawns the lifetime poller and the input thread, `db::open_and_spawn_writer` the writer, and the proxy one driver task per tracked response. Headless mode (`--no-tui`) runs only the proxy, the writer and the signal task: no poller, no sampler (so no sudo), no lifetime poller.
+`main` spawns the proxy, the signal task (SIGINT, SIGTERM, SIGHUP) and, in TUI mode, the model poller and the hardware sampler. `tui::run` spawns the lifetime poller and the input thread, `db::open_and_spawn_writer` the writer, and the proxy one driver task per tracked response. Headless mode (`--no-tui`) runs only the proxy, the writer and the signal task: no poller, no sampler (so no sudo), no lifetime poller.
 
 ## Modules
 
@@ -68,13 +68,12 @@ Clients must point at the proxy port (or the user moves Ollama to another port a
 
 For each request the handler:
 
-1. Reads the whole request body into memory (`axum::body::to_bytes`, capped at 64 MiB). A body it can't read, or one over the cap (an `ollama create` blob push, say), gets a 500.
-2. Applies the OpenAI rewrite (next section) where it applies.
-3. Forwards the method, path + query and headers through one shared `reqwest::Client`, dropping the hop-by-hop headers, `Host` and `Content-Length`. The client has no overall timeout (a long generation must not be cut off), a 90 s idle-pool timeout and `TCP_NODELAY`. It's built without decompression features, so bytes arrive exactly as Ollama sent them.
-4. Returns Ollama's status and headers, minus the hop-by-hop headers and `Content-Length`, so response bodies always go out chunked.
-5. Tees the body (see [Streaming response tee](#streaming-response-tee)) only when the status is 2xx and `parser::classify` recognises the path; everything else streams straight through.
+1. Picks how to send the request body. On the OpenAI rewrite paths (next section) it reads the whole body into memory, capped at 64 MiB (a bigger one gets 413, an unreadable one 400), and applies the rewrite. Every other body streams to Ollama as it arrives (`reqwest::Body::wrap_stream`), whatever its size, so an `ollama create` blob push of several gigabytes goes straight through.
+2. Forwards the method, path + query and headers through one shared `reqwest::Client`, dropping the hop-by-hop headers and `Host`. `Content-Length` is kept for a streamed body, which arrives unchanged, and dropped for a buffered one, whose length reqwest sets after any rewrite. The client has no overall timeout (a long generation must not be cut off), a 90 s idle-pool timeout and `TCP_NODELAY`. It's built without decompression features, so bytes arrive exactly as Ollama sent them.
+3. Returns Ollama's status and headers, minus the hop-by-hop headers and `Content-Length`, so response bodies always go out chunked.
+4. Tees the body (see [Streaming response tee](#streaming-response-tee)) only when the status is 2xx and `parser::classify` recognises the path; everything else streams straight through.
 
-The proxy's own errors are 502 (Ollama unreachable), 500 (a request body it can't read or that's too big, or a response it can't build) and 405 (a method reqwest can't represent).
+The proxy's own errors are 502 (Ollama unreachable), 413 (a buffered body over 64 MiB), 400 (a request body it can't read), 500 (a response it can't build) and 405 (a method reqwest can't represent).
 
 Because reqwest sets `Host` from `--ollama-url`, Ollama never sees the client's `Host`. Ollama's DNS-rebinding protection (while it listens on loopback it accepts only local host names) therefore doesn't cover requests that arrive through the proxy. The client's `Origin` header is forwarded untouched, so Ollama's CORS check still applies.
 
@@ -173,7 +172,7 @@ Timestamps are RFC 3339 strings in UTC (`2026-10-03T23:53:26.322907+00:00`). `en
 
 All writes go through one writer: `db::open_and_spawn_writer` runs a loop on tokio's blocking pool (`spawn_blocking` + `blocking_recv`) that owns the connection, and `DbHandle` is a cloneable `mpsc::Sender` (256) for its commands. Each record is its own autocommit `INSERT`. The lifetime poller's second connection is an ordinary read-write one that only ever reads. The writer keeps rusqlite's default 5 s busy timeout and the reader sets 500 ms, which covers the brief locks rollback journaling takes.
 
-A session row is inserted at startup and its `ended_at` filled in on a clean shutdown (see [Startup and shutdown](#startup-and-shutdown)). A crash, a `kill -9`, a TUI error or closing the terminal window (SIGHUP isn't handled) leaves it NULL.
+A session row is inserted at startup and its `ended_at` filled in on a clean shutdown (see [Startup and shutdown](#startup-and-shutdown)). Closing the terminal window (SIGHUP) and a TUI error both still end the session cleanly; only a crash or a `kill -9` leaves it NULL.
 
 ## Pricing
 
@@ -240,11 +239,13 @@ The screen redraws after every event (records, polls, keys, resize) plus a 250 m
 
 Terminal restore is bracketed by:
 
-1. a panic hook, installed **before** `ratatui::init()`, that calls `ratatui::restore()` and then chains the original hook;
-2. `ratatui::init()`, which enters raw mode and the alternate screen;
-3. `ratatui::restore()` on every normal exit path.
+1. a panic hook, installed first, that restores the terminal and then chains the original hook;
+2. `tui::init_terminal`, which enters raw mode and the alternate screen the way `ratatui::try_init` does, but without installing ratatui's own panic hook;
+3. a restore on every normal exit path.
 
-`q`, `Ctrl-C`, SIGINT, SIGTERM and panics all restore the terminal.
+Restoring always goes through `ratatui::try_restore()`, with errors only logged at debug. `ratatui::restore()` and the hook `ratatui::init()` installs report failure with `eprintln!`, and once a SIGHUP has taken the terminal away that write fails and panics, which inside a panic hook aborts the process. For the same reason a failed draw after shutdown has been signalled counts as a clean exit, and headless mode writes its summary lines with `writeln!` and ignores errors.
+
+`q`, `Ctrl-C`, SIGINT, SIGTERM, SIGHUP and panics all restore the terminal (or try to, when it's already gone).
 
 ## Logging
 
@@ -266,14 +267,14 @@ Startup, in order:
 6. Spawn the proxy and the signal task, plus, in TUI mode, the poller and the hardware sampler (which starts powermetrics).
 7. Run the TUI or the headless loop.
 
-Shutdown starts with `q`, `Ctrl-C` (a key press in the TUI), SIGINT or SIGTERM, all of which set the `watch` flag:
+Shutdown starts with `q`, `Ctrl-C` (a key press in the TUI), SIGINT, SIGTERM or SIGHUP (the terminal window closing), all of which set the `watch` flag:
 
-1. The TUI loop returns and restores the terminal (or the headless loop returns).
+1. The TUI loop returns and restores the terminal (or the headless loop returns). If the UI exits with an error instead, it's logged and the remaining steps still run.
 2. Workers get 3 s to finish. axum's graceful shutdown stops accepting and waits for open connections, so a generation still streaming holds it up; after 3 s it's abandoned.
 3. `end_session` writes `ended_at`.
 4. `runtime.shutdown_background()` drops whatever is left, and the log is flushed.
 
-A record that completes after the UI loop exits is dropped (nothing reads `records_rx` any more), and streams still open after the 3 s grace are cut. SIGHUP isn't handled, so closing the terminal window ends the process without any of the steps above.
+A record that completes after the UI loop exits is dropped (nothing reads `records_rx` any more), and streams still open after the 3 s grace are cut. The sudo child sits in its own process group, so a closing terminal doesn't signal it directly; the sampler's SIGTERM in step 2 stops it.
 
 ## Testing and CI
 
@@ -281,7 +282,7 @@ All tests run without Ollama, sudo or a terminal:
 
 - **Parser**: fixture-driven (`fixtures/`, captured from real Ollama responses), with bodies fed in 64-byte chunks to exercise frame reassembly.
 - **API**: `/api/tags` and `/api/ps` parsing, `merge_models` ordering and states, name canonicalisation.
-- **Proxy**: the request rewrite; the driver task's behaviour (trailer drain after `finish_reason`, no drain mid-generation, load calls not recorded) on tokio's paused clock; `bind` errors; and one end-to-end test over real sockets (client → `serve` → mock upstream) that checks the bytes arrive unchanged and exactly one record is emitted.
+- **Proxy**: the request rewrite and its 64 MiB cap; the driver task's behaviour (trailer drain after `finish_reason`, no drain mid-generation, load calls not recorded) on tokio's paused clock; `bind` errors; and end-to-end tests over real sockets (client → `serve` → mock upstream): one checks a response arrives unchanged with exactly one record emitted, another streams an upload just over the buffering cap through intact.
 - **TUI**: renders into ratatui's `TestBackend`. `hardware_row_survives_at_minimum_height` guards the 120×36 minimum, and `screen_snapshot` prints 120×36 and 160×44 screens for eyeballing.
 - **DB, pricing, aggregator, hardware formatting**: unit tests. The DB helper names temp files with a counter, not the clock, so parallel tests can't collide.
 
@@ -292,7 +293,7 @@ GitLab CI (`.gitlab-ci.yml`, shared with LMS-Monitor) runs `cargo fmt --all --ch
 ## Notable invariants
 
 - Each captured request is persisted exactly once, by the loop that owns `records_rx`, and the DB writer is the only writer.
-- Responses are forwarded byte for byte. The deliberate exceptions are the OpenAI `include_usage` request rewrite, the 64 MiB request-body cap, and the hop-by-hop / `Host` / `Content-Length` header handling. Parser failures never change what the client sees.
+- Responses are forwarded byte for byte. The deliberate exceptions are the OpenAI `include_usage` request rewrite (with its 64 MiB cap on those bodies) and the hop-by-hop / `Host` / `Content-Length` header handling. Parser failures never change what the client sees.
 - The proxy is the only capture path. Direct hits on Ollama's port are invisible by design.
 - Nothing writes to stdout or stderr while the TUI is up.
 - A client abort mid-generation must drop the upstream stream (that's how cancellation reaches Ollama); only a finished stream waiting on its usage frame gets drained.

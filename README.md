@@ -73,7 +73,7 @@ OLLAMA_HOST=127.0.0.1:11400 ollama serve
 ollama-monitor --proxy-listen 127.0.0.1:11434 --ollama-url http://127.0.0.1:11400
 ```
 
-Everything that talks to `:11434` then goes through the proxy, the `ollama` CLI included. The proxy holds each request body in memory and refuses bodies over 64 MiB, so a large upload such as `ollama create` from a local model file fails through it; run that with `OLLAMA_HOST=127.0.0.1:11400`.
+Everything that talks to `:11434` then goes through the proxy, the `ollama` CLI included. Uploads such as `ollama create` from a local model file stream straight through to Ollama.
 
 ### Flags
 

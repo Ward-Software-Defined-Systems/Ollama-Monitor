@@ -2,15 +2,17 @@
 //!
 //! - `bind` claims `--proxy-listen` up front (main calls it before the sudo prompt and
 //!   the TUI), so a taken port or a bad address fails at startup.
-//! - Forwards every request to `--ollama-url`. Request bodies are buffered (64 MiB cap)
-//!   so OpenAI-compatible ones can get `stream_options.include_usage` injected; response
-//!   bodies stream through to the client unbuffered.
+//! - Forwards every request to `--ollama-url`. OpenAI-compatible request bodies are
+//!   buffered (64 MiB cap, 413 past it) so they can get `stream_options.include_usage`
+//!   injected; all other request bodies, and every response body, stream through
+//!   unbuffered.
 //! - For inference paths (`/api/chat`, `/api/generate`, `/v1/chat/completions`,
 //!   `/v1/completions`) a per-request driver task tees each response chunk into a
 //!   `parser::Accumulator`. When the body finishes, the accumulator is finalized and an
 //!   `InferenceRecord` is sent to `records_tx` (model load/unload calls excepted).
 //! - Parser failures never change the bytes the client sees. The proxy's own errors are
-//!   502 (upstream unreachable), 500 (request body unreadable or over the cap) and 405.
+//!   502 (upstream unreachable), 413 (buffered body over the cap), 400 (request body
+//!   unreadable), 500 (response couldn't be built) and 405.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -18,7 +20,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
@@ -116,35 +118,37 @@ async fn handle(State(state): State<ProxyState>, req: Request) -> Result<Respons
 
     debug!(method = %method, path = %uri.path(), "proxy request received");
 
-    // Read the full body up-front via axum::body::to_bytes (the supported
-    // axum 0.8 + hyper 1.x path). The 64 MiB cap covers chat/generate easily and
-    // bounds memory; bigger uploads (an `ollama create` blob push) get a 500.
-    let body_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(err) => {
-            warn!(error = %err, "failed to read incoming request body");
-            return Err(ProxyError::ResponseBuild);
-        }
+    // Only bodies the proxy may rewrite are buffered (capped, 413 past it). Everything
+    // else streams to Ollama as it arrives, whatever its size: an `ollama create` blob
+    // push can be gigabytes.
+    let streamed = !rewrites_request_body(uri.path()) && !body.is_end_stream();
+    let upstream_body = if rewrites_request_body(uri.path()) {
+        // For OpenAI-compatible streaming endpoints, ensure the upstream returns
+        // a usage block so the parser can record the request. Without
+        // stream_options.include_usage: true, Ollama omits usage entirely from
+        // SSE — and that's the default in most clients (Open WebUI, Continue,
+        // raw OpenAI SDK, ...). Injecting it is silent to clients (the extra
+        // chunk has choices: []) and turns capture rate from ~0% to ~100%.
+        let bytes = read_capped(body, MAX_BUFFERED_BODY).await?;
+        reqwest::Body::from(ensure_openai_include_usage(uri.path(), bytes))
+    } else if streamed {
+        reqwest::Body::wrap_stream(body.into_data_stream())
+    } else {
+        reqwest::Body::from(Bytes::new())
     };
-
-    // For OpenAI-compatible streaming endpoints, ensure the upstream returns
-    // a usage block so the parser can record the request. Without
-    // stream_options.include_usage: true, Ollama omits usage entirely from
-    // SSE — and that's the default in most clients (Open WebUI, Continue,
-    // raw OpenAI SDK, ...). Injecting it is silent to clients (the extra
-    // chunk has choices: []) and turns capture rate from ~0% to ~100%.
-    let body_bytes = ensure_openai_include_usage(uri.path(), body_bytes);
 
     let mut upstream_req = state
         .client
         .request(reqwest_method(&method)?, &upstream_url)
-        .body(body_bytes);
+        .body(upstream_body);
 
     for (name, value) in headers.iter() {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || name.as_str() == "host" {
             continue;
         }
-        if matches!(name.as_str(), "host" | "content-length") {
+        // A streamed body is forwarded unchanged, so its length still holds; a buffered
+        // one may have been rewritten, and reqwest sets the length for it.
+        if name.as_str() == "content-length" && !streamed {
             continue;
         }
         upstream_req = upstream_req.header(name.as_str(), value);
@@ -341,14 +345,39 @@ where
     }
 }
 
+/// Cap on a buffered request body. Only bodies the proxy may rewrite are buffered.
+const MAX_BUFFERED_BODY: usize = 64 * 1024 * 1024;
+
+/// Paths whose request bodies may get `stream_options.include_usage` injected, and so
+/// are buffered instead of streamed.
+fn rewrites_request_body(path: &str) -> bool {
+    path.contains("/v1/chat/completions") || path.contains("/v1/completions")
+}
+
+/// Collect a request body, refusing it once it passes `cap` bytes.
+async fn read_capped(body: Body, cap: usize) -> Result<Bytes, ProxyError> {
+    let mut stream = body.into_data_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            warn!(error = %err, "failed to read incoming request body");
+            ProxyError::BodyUnreadable
+        })?;
+        if buf.len() + chunk.len() > cap {
+            warn!(cap, "request body over the buffering cap; refused with 413");
+            return Err(ProxyError::BodyTooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
 /// For /v1/chat/completions and /v1/completions, set stream_options.include_usage = true
 /// in the JSON body so Ollama emits a final SSE chunk containing token counts.
 /// Returns the original bytes if the path doesn't match, the body is empty (CORS
 /// preflights, GETs) or isn't valid JSON, or it isn't a JSON object.
 fn ensure_openai_include_usage(path: &str, body: Bytes) -> Bytes {
-    if body.is_empty()
-        || !(path.contains("/v1/chat/completions") || path.contains("/v1/completions"))
-    {
+    if body.is_empty() || !rewrites_request_body(path) {
         return body;
     }
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
@@ -408,6 +437,10 @@ fn stats_to_record(stats: ParsedStats, session_id: i64) -> InferenceRecord {
 enum ProxyError {
     #[error("upstream unreachable")]
     UpstreamUnreachable,
+    #[error("request body too large")]
+    BodyTooLarge,
+    #[error("could not read request body")]
+    BodyUnreadable,
     #[error("could not build response")]
     ResponseBuild,
     #[error("unsupported method")]
@@ -418,6 +451,8 @@ impl axum::response::IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = match self {
             ProxyError::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
+            ProxyError::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ProxyError::BodyUnreadable => StatusCode::BAD_REQUEST,
             ProxyError::ResponseBuild => StatusCode::INTERNAL_SERVER_ERROR,
             ProxyError::UnsupportedMethod => StatusCode::METHOD_NOT_ALLOWED,
         };
@@ -660,12 +695,28 @@ mod tests {
         );
     }
 
+    /// Serves `mock` as the upstream and a real proxy in front of it, both on
+    /// `127.0.0.1:0`. Hold on to the returned `watch::Sender`: dropping it reads as a
+    /// shutdown signal.
+    async fn spawn_proxy(
+        mock: Router,
+    ) -> (String, mpsc::Receiver<InferenceRecord>, watch::Sender<bool>) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(upstream, mock).await });
+
+        let listener = bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let (records_tx, records_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(serve(listener, upstream_url, 7, records_tx, shutdown_rx));
+        (proxy_url, records_rx, shutdown_tx)
+    }
+
     /// Real sockets end to end: client → proxy → mock upstream replaying a captured stream.
     #[tokio::test]
     async fn proxies_and_records_over_real_sockets() {
         const STREAM: &str = include_str!("../fixtures/ollama-chat-stream.jsonl");
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
         let mock = Router::new().route(
             "/api/chat",
             axum::routing::post(|| async {
@@ -675,14 +726,7 @@ mod tests {
                 )
             }),
         );
-        tokio::spawn(async move { axum::serve(upstream, mock).await });
-
-        let listener = bind("127.0.0.1:0").unwrap();
-        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-        let (records_tx, mut records_rx) = mpsc::channel(4);
-        // Keep the sender alive: a dropped sender reads as a shutdown signal.
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        tokio::spawn(serve(listener, upstream_url, 7, records_tx, shutdown_rx));
+        let (proxy_url, mut records_rx, _shutdown_tx) = spawn_proxy(mock).await;
 
         let body = reqwest::Client::new()
             .post(format!("{proxy_url}/api/chat"))
@@ -700,5 +744,60 @@ mod tests {
         assert_eq!(record.model_id, "qwen3:14b");
         assert_eq!(record.envelope, "ollama-stream");
         assert!(record.gen_tokens > 0);
+    }
+
+    /// An upload bigger than the buffering cap (an `ollama create` blob push) streams
+    /// through intact, with its Content-Length.
+    #[tokio::test]
+    async fn large_upload_streams_past_the_buffer_cap() {
+        let mock = Router::new().route(
+            "/api/blobs/{digest}",
+            axum::routing::post(|headers: axum::http::HeaderMap, body: Body| async move {
+                let mut received = 0usize;
+                let mut stream = body.into_data_stream();
+                while let Some(chunk) = stream.next().await {
+                    received += chunk.unwrap().len();
+                }
+                let declared = headers
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default();
+                format!("{received} {declared}")
+            }),
+        );
+        let (proxy_url, _records_rx, _shutdown_tx) = spawn_proxy(mock).await;
+
+        let size = MAX_BUFFERED_BODY + 1;
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy_url}/api/blobs/sha256:abc"))
+            .body(vec![7u8; size])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), format!("{size} {size}"));
+    }
+
+    #[tokio::test]
+    async fn read_capped_refuses_bodies_over_the_cap() {
+        let ok = read_capped(Body::from("12345678"), 8).await.unwrap();
+        assert_eq!(ok, Bytes::from_static(b"12345678"));
+        assert!(matches!(
+            read_capped(Body::from("123456789"), 8).await,
+            Err(ProxyError::BodyTooLarge)
+        ));
+    }
+
+    #[test]
+    fn body_errors_map_to_client_error_statuses() {
+        use axum::response::IntoResponse;
+        assert_eq!(
+            ProxyError::BodyTooLarge.into_response().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            ProxyError::BodyUnreadable.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 }
