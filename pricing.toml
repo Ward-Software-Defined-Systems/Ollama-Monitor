@@ -1,5 +1,5 @@
 # Hypothetical frontier-API pricing per 1M tokens, USD.
-# Based on the LM Studio monitor's table (STEP-0-FINDINGS §0.5).
+# List prices, updated 2026-10-03; kept identical to lmstudio-monitor's table.
 # Override with: ~/Library/Application Support/ollama-monitor/config.toml
 #   [pricing.providers.anthropic.models.claude-opus-4-8]
 #   input_per_mtok_usd  = 4.00

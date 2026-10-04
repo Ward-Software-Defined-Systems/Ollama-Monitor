@@ -1,157 +1,152 @@
-# ollama-monitor
+# Ollama-Monitor
 
-A standalone Rust TUI that observes [Ollama](https://ollama.com) inference activity on `localhost` via a transparent reverse proxy and surfaces:
+A terminal dashboard for [Ollama](https://ollama.com) on macOS. It sits in front of your local Ollama as a transparent proxy and shows every request's tokens, time to first token and throughput, what the same tokens would have cost on frontier APIs, and live Apple Silicon hardware telemetry.
 
-- **Models** — every installed model (local and `:cloud`) with its state (loaded / cloud / not-loaded); `▸` marks the last request's target
-- **Live request feed** — last 30 completed inferences (timestamp, model, prompt/gen tokens, TTFT, tok/s, stop reason)
-- **Rolling throughput** — 1m / 5m / 15m / session-lifetime windows
-- **Hypothetical frontier cost** — Claude Fable 5.1, Fable 5, Opus 5.5, Opus 5, Opus 4.8, Gemini 3.1 Pro priced against local token counts
-- **Hardware** — system + Ollama process tree CPU%, memory, GPU active residency, ANE power
-- **Cross-session SQLite persistence** — lifetime totals available across restarts
+![Ollama-Monitor running in a terminal](assets/Ollama-Monitor.png)
 
-No real frontier API calls — costs come from a baked-in pricing table. No daemon. Single binary.
+## Features
 
-## How it observes inference
+- **Live request feed**: the last 30 completed requests with time, model, prompt and generated tokens, time to first token, tokens per second and stop reason. A `~` marks counts that had to be estimated (see [Capture accuracy](#capture-accuracy)).
+- **Models**: every installed model, local and `:cloud`, with its type, format, quantization, context length and state (loaded, cloud or not-loaded); `▸` marks the model the last request went to.
+- **Rolling metrics**: requests, tokens, mean and p95 tokens per second, and mean time to first token over the last 1, 5 and 15 minutes and the whole session.
+- **Hypothetical cost**: your session's token counts priced at list rates for Claude Fable 5.1, Fable 5, Opus 5.5, Opus 5, Opus 4.8 and Gemini 3.1 Pro.
+- **Hardware**: system CPU and memory, CPU and memory of the Ollama process tree, GPU active residency and Neural Engine power.
+- **History**: lifetime request and token totals across sessions, kept in a local SQLite database.
 
-Ollama returns per-request stats (`eval_count`, `eval_duration`, `prompt_eval_count`, `prompt_eval_duration`, `total_duration`, `done_reason`) only in the response body to the calling client — nothing is broadcast to a third-party observer like LM Studio's `lms log stream` does. To capture those stats, this app runs an HTTP **reverse proxy** in front of Ollama:
+## How it works
+
+Ollama returns per-request stats (token counts, durations, stop reason) only in the response to the client that made the request; there's nothing a separate program can subscribe to. So Ollama-Monitor runs a reverse proxy in front of Ollama:
 
 ```
-client → :11435 (ollama-monitor)  →  :11434 (ollama)
-                ↓ tees response stream
-        parses final stats chunk → SQLite + TUI
+client ──▶ :11435 ollama-monitor ──▶ :11434 ollama
+                  │ copies each response as it streams past
+                  ▼
+            parses the final stats ──▶ SQLite + dashboard
 ```
 
-Point your Ollama clients at the monitor port (default `11435`), and the proxy transparently forwards everything to Ollama on `11434`. Token counts and timings come straight from the upstream response — the proxy does not synthesize them.
+Point your clients at the proxy's port instead of Ollama's. Requests and responses pass through unchanged, with one exception: for streaming OpenAI-compatible requests the proxy adds `stream_options.include_usage: true`, so that Ollama reports token counts. Clients ignore the extra final chunk this produces. Requests sent straight to Ollama's own port aren't seen.
 
-Four response envelopes are recognised automatically:
+It also polls Ollama's `/api/version`, `/api/tags` and `/api/ps` every 2 seconds for the model list. Hardware figures come from [`sysinfo`](https://crates.io/crates/sysinfo) and from macOS's `powermetrics`, which needs sudo.
 
-| envelope | path | trigger |
-|---|---|---|
-| Ollama-native streaming | `/api/chat`, `/api/generate` | `stream: true` (default) |
-| Ollama-native non-streaming | `/api/chat`, `/api/generate` | `stream: false` |
-| OpenAI-compatible SSE | `/v1/chat/completions` | `stream: true` — proxy auto-injects `stream_options.include_usage` so token counts always come back |
-| OpenAI-compatible non-streaming | `/v1/chat/completions` | `stream: false` |
-
-Requests that bypass the proxy (direct hits on `:11434`) are not captured — by design.
-
-## Status
-
-v0.1.0. Built on top of an existing LM Studio monitor architecture; replaces the `lms log stream` event source with the reverse proxy. The TUI is a port of LMS-Monitor's — same panels, columns and keys — so the two can run side by side.
+**Privacy:** the database stores only per-request metadata (model, token counts, timings), never prompt or response text. The monitor talks only to the Ollama server you point it at; the cost figures come from a pricing table compiled into the binary.
 
 ## Requirements
 
-- macOS (Apple Silicon recommended for GPU/ANE telemetry)
-- Ollama installed and running (`ollama serve`, default port 11434)
-- Rust 1.94+ (2024 edition)
-- `sudo` access for the GPU/ANE row (`powermetrics` requires elevation; you'll be prompted once per launch)
+- macOS. Apple Silicon is recommended: the GPU and Neural Engine figures come from `powermetrics`.
+- Ollama running (the desktop app or `ollama serve`), by default on port 11434.
+- Rust 1.94 or newer, to build.
+- sudo, for the GPU and Neural Engine figures only.
 
-## Build
+## Install
 
-```sh
-cargo build --release
-# Produces target/release/ollama-monitor (~7.9 MB)
-```
-
-## Run
+Clone the repository, then from its directory:
 
 ```sh
-target/release/ollama-monitor
+cargo build --release          # binary at target/release/ollama-monitor
+cargo install --path .         # or: put ollama-monitor on your PATH via ~/.cargo/bin
 ```
 
-You'll be prompted for your sudo password — used solely to spawn `powermetrics --samplers cpu_power,gpu_power,ane_power -i 2000`. The TUI then opens.
-
-Run it as your normal user, not under `sudo`: the app asks for elevation only for powermetrics, so the proxy (which may be network-facing) never runs as root.
-
-If you'd rather skip GPU/ANE and avoid the prompt, use headless mode:
+## Usage
 
 ```sh
-target/release/ollama-monitor --no-tui
+ollama-monitor
 ```
 
-Headless prints one summary line per completed inference to stderr and persists records to SQLite.
-
-### Pointing clients at the proxy
-
-By default the proxy listens on `127.0.0.1:11435` and forwards to `http://127.0.0.1:11434`. Configure clients (Open WebUI, custom code, etc.) to use the proxy port:
+Then point your clients at `http://127.0.0.1:11435` instead of Ollama's `:11434`:
 
 ```sh
-# direct (untracked)
-curl http://localhost:11434/api/chat -d '{"model":"qwen3:14b", ...}'
-
-# through the monitor (tracked)
-curl http://localhost:11435/api/chat -d '{"model":"qwen3:14b", ...}'
+curl http://localhost:11435/api/chat -d '{"model": "qwen3:14b", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
-For network-accessible monitoring (other machines or VMs hitting this Mac), bind the proxy on `0.0.0.0`:
+At launch it asks for your sudo password, used only to start `powermetrics` for the GPU and Neural Engine figures. Run it as your normal user, not under `sudo`, so the proxy never runs as root. If sudo fails, those two figures show `n/a` and everything else still works.
+
+`--no-tui` runs headless instead: one summary line per request on stderr, still recorded to the database, and no sudo prompt.
+
+To let other machines or VMs use the proxy, bind it to all interfaces with `--proxy-listen 0.0.0.0:11435`. The proxy has no authentication of its own, so this exposes your Ollama to that network, just as `OLLAMA_HOST=0.0.0.0` would.
+
+To capture clients you can't reconfigure, move Ollama to another port and give its usual port to the proxy:
 
 ```sh
-ollama-monitor --proxy-listen 0.0.0.0:11435
+OLLAMA_HOST=127.0.0.1:11400 ollama serve
+ollama-monitor --proxy-listen 127.0.0.1:11434 --ollama-url http://127.0.0.1:11400
 ```
-
-If you want the monitor to take over `:11434` entirely so existing clients work unchanged, restart Ollama on a different port (`OLLAMA_HOST=127.0.0.1:11400 ollama serve`) and run the monitor with `--proxy-listen 0.0.0.0:11434 --ollama-url http://127.0.0.1:11400`.
 
 ### Flags
 
 | flag | default | purpose |
 |---|---|---|
-| `--proxy-listen <ADDR>` | `127.0.0.1:11435` | Address the reverse proxy listens on |
-| `--ollama-url <URL>` | `http://127.0.0.1:11434` (env `OLLAMA_URL`) | Upstream Ollama base URL |
-| `--config <PATH>` | macOS app-support dir | Optional user config TOML |
-| `--db <PATH>` | macOS app-support dir | SQLite usage DB |
-| `--no-tui` | off | Headless: print one summary line per inference; no UI |
+| `--proxy-listen <ADDR>` | `127.0.0.1:11435` | where the proxy listens |
+| `--ollama-url <URL>` | `http://127.0.0.1:11434` (env `OLLAMA_URL`) | upstream Ollama |
+| `--config <PATH>` | `~/Library/Application Support/ollama-monitor/config.toml` | optional config file |
+| `--db <PATH>` | `~/Library/Application Support/ollama-monitor/usage.db` | SQLite database |
+| `--no-tui` | off | headless mode |
 
-### Keys (TUI)
+### Keys
 
 | key | action |
 |---|---|
-| `q` / `Ctrl-C` | quit (terminal restored, session closed in DB) |
-| `r` | reset session counters (records remain in DB) |
-| `p` | pause UI updates (records still persist) |
+| `q` or `Ctrl-C` | quit |
+| `r` | reset the session counters (the database keeps everything) |
+| `p` | pause the display (requests are still recorded) |
 
-## File locations (macOS)
+## Capture accuracy
 
-- DB: `~/Library/Application Support/ollama-monitor/usage.db`
-- App log: `~/Library/Application Support/ollama-monitor/ollama-monitor.log`
-- User config (optional): `~/Library/Application Support/ollama-monitor/config.toml`
+| request type | what's measured |
+|---|---|
+| Ollama native (`/api/chat`, `/api/generate`), streaming or not | exact: token counts and durations come from Ollama itself |
+| OpenAI-compatible streaming (`/v1/chat/completions`, `/v1/completions`) | exact token counts; timings measured at the proxy |
+| OpenAI-compatible, non-streaming | exact token counts; tokens per second is end to end (it includes prompt processing), so it understates decode speed |
+| `:cloud` models when Ollama's cloud relay drops the usage chunk ([ollama/ollama#15169](https://github.com/ollama/ollama/issues/15169)) | estimated: generated tokens are counted from streamed chunks and prompt tokens show as 0; marked with `~` |
 
-Set `OLLAMA_MONITOR_LOG=debug` (or `trace`) for verbose tracing in the log file. `trace` includes raw `powermetrics` lines, useful for diagnosing GPU/ANE parsing.
+A request that ends without any usable stats isn't recorded; the log notes it as `no parsable stats in response`.
 
-## Override pricing
+## Configuration
 
-Defaults are baked in from [`pricing.toml`](./pricing.toml). To override, drop a TOML file at `~/Library/Application Support/ollama-monitor/config.toml`:
+Prices live in [`pricing.toml`](pricing.toml) and are compiled in. To change one, add an override to `~/Library/Application Support/ollama-monitor/config.toml`:
 
 ```toml
 [pricing.providers.anthropic.models.claude-opus-4-8]
-input_per_mtok_usd  = 4.00
-output_per_mtok_usd = 20.00
+input_per_mtok_usd  = 5.00
+output_per_mtok_usd = 25.00
 ```
 
-## Caveats per envelope
+The cost panel is a rough comparison, not a quote. It applies list prices to your local model's token counts (a frontier model would tokenize the same text differently), and it ignores prompt caching, batch discounts and long-context pricing tiers.
 
-- **Ollama-native** (both stream and non-stream) is the highest-fidelity source: token counts and durations come from llama.cpp directly. `tok/s = eval_count / eval_duration`.
-- **OpenAI-compatible streaming**: the proxy rewrites the request body on the way through, ensuring `stream_options.include_usage: true` is set so the upstream emits a final usage chunk with token counts. The injection is invisible to clients (the extra chunk has `choices: []` and most renderers ignore it). Without this, almost no OpenAI clients (Open WebUI, Continue, raw OpenAI SDK, Cursor, …) would ever produce captureable stats.
-- **OpenAI-compatible non-streaming** has all bytes arrive at once, so the proxy can't separate prompt-eval time from generation time. We report `tok/s` as `completion_tokens / wall_total` — an end-to-end throughput, lower bound on pure decode rate.
-- **`:cloud` models (approximate envelope)**: requests to cloud-hosted models (e.g. `deepseek-v4-pro:cloud`) are proxied by the local Ollama daemon to ollama.com. The upstream cloud-proxy intermittently drops the terminal `usage` SSE frame (tracked in [ollama/ollama#15169](https://github.com/ollama/ollama/issues/15169)) and can also reset the connection mid-stream ([ollama/ollama#15910](https://github.com/ollama/ollama/issues/15910)). When that happens, the monitor still records the request but tags it with envelope `openai-sse-approx`: `prompt_tokens` is `0` (we never see it), `gen_tokens` is the count of streamed SSE chunks (a coarse proxy for completion tokens), and the TUI live-feed prefixes the affected columns with `~` to flag the estimate. Full captures (`openai-sse`) are still preferred whenever the usage frame does arrive.
+## Files
 
-If a request still goes unrecorded, the monitor logs `no parsable stats in response (request not recorded)` at info level — check the log to see which path was unparseable.
+| file | location |
+|---|---|
+| database | `~/Library/Application Support/ollama-monitor/usage.db` |
+| log | `~/Library/Application Support/ollama-monitor/ollama-monitor.log` |
+| config (optional) | `~/Library/Application Support/ollama-monitor/config.toml` |
+
+Set `OLLAMA_MONITOR_LOG=debug` or `OLLAMA_MONITOR_LOG=trace` for more detail in the log; `trace` includes the raw `powermetrics` output.
 
 ## Troubleshooting
 
 | symptom | check |
 |---|---|
-| header shows "server: ● unreachable" | `curl http://localhost:11434/api/version` — is `ollama serve` actually running? The `err:` text after it names the failing endpoint |
-| exits at startup with "Permission denied" on the log or DB | the app-support dir is root-owned from an earlier `sudo` launch: `sudo chown -R "$USER":staff ~/Library/Application\ Support/ollama-monitor`, then run without sudo |
-| GPU or ANE shows `n/a` | `OLLAMA_MONITOR_LOG=trace` then grep `powermetrics` in the log — the parser tolerates label variants but isn't psychic |
-| no records appear despite traffic | clients still pointed at `:11434` instead of `:11435` — verify with `curl http://localhost:11435/api/version` (should return Ollama's version) |
-| sudo prompt fails / app exits | `sudo -v` once before launch, or use `--no-tui` |
+| header shows `server: ● unreachable` | Is Ollama running (`curl http://localhost:11434/api/version`)? The `err:` text after the status names the call that failed. |
+| no requests appear | Clients are probably still talking to `:11434`. `curl http://localhost:11435/api/version` should answer through the proxy. |
+| "Permission denied" on the log or database at startup | An earlier run under `sudo` left root-owned files: `sudo chown -R "$USER":staff ~/Library/Application\ Support/ollama-monitor`. |
+| GPU or ANE shows `n/a` | Run with `OLLAMA_MONITOR_LOG=trace` and search the log for `powermetrics`. |
+| sudo prompt fails | Run `sudo -v` first, or use `--no-tui`. |
 
 ## Development
 
 ```sh
-cargo test                # unit + fixture tests: parser, proxy, api merge, aggregator, pricing, db, hardware, TUI render
-cargo test screen_snapshot -- --nocapture         # print the TUI at 120x36 and 160x44 from fixtures
-cargo test live_ollama -- --ignored --nocapture   # render the models panel from the real local Ollama (read-only)
-cargo run -- --help
+cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
+cargo test screen_snapshot -- --nocapture         # print the dashboard at 120x36 and 160x44 from fixtures
+cargo test live_ollama -- --ignored --nocapture   # render the models panel from your local Ollama (read-only)
 ```
 
-See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for module layout, data flow, and design decisions.
+CI ([`.gitlab-ci.yml`](.gitlab-ci.yml)) runs the same checks on Linux. [ARCHITECTURE.md](ARCHITECTURE.md) covers the module layout, data flow and design decisions.
+
+Ollama-Monitor shares its dashboard with LMS-Monitor, a sibling project for [LM Studio](https://lmstudio.ai).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+Ollama-Monitor is an independent project, not affiliated with or endorsed by Ollama, Anthropic or Google.

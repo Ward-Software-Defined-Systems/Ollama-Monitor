@@ -1,0 +1,61 @@
+# Format, lint and test on a Linux Docker runner.
+#
+# The app targets macOS, but only runtime pieces (powermetrics, process
+# discovery, app-support paths) are platform-specific, so the full test suite
+# runs on Linux. Pipeline secret detection is configured at the GitLab level;
+# its jobs run in the `test` stage.
+
+workflow:
+  rules:
+    # Merge request pipelines; branch pipelines only when no MR is open (so one
+    # push doesn't run twice); tags.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - lint
+  - test
+
+default:
+  # Pinned to the toolchain used for development so new lints don't break CI.
+  image: rust:1.97
+  interruptible: true
+
+variables:
+  # Keep cargo's registry inside the project dir so GitLab can cache it.
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo-home
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+.cargo-cache:
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo-home/registry/index/
+      - .cargo-home/registry/cache/
+      - .cargo-home/git/db/
+      - target/
+
+fmt:
+  stage: lint
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all --check
+
+clippy:
+  stage: lint
+  extends: .cargo-cache
+  script:
+    - rustup component add clippy
+    - cargo clippy --all-targets --locked -- -D warnings
+
+test:
+  stage: test
+  extends: .cargo-cache
+  script:
+    - cargo test --locked

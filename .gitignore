@@ -1,2 +1,39 @@
-/target
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local runtime data (the apps default to ~/Library/Application Support,
+# but --db / --config can point anywhere)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+.env
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+# Finder's custom-icon file is literally "Icon\r"; git strips one trailing CR, hence two
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
