@@ -53,7 +53,10 @@ pub fn load(user: Option<&UserConfig>) -> Arc<PricingTable> {
         }
     }
 
-    if let Some(overrides) = user.and_then(|u| u.pricing.as_ref()).and_then(|p| p.providers.as_ref()) {
+    if let Some(overrides) = user
+        .and_then(|u| u.pricing.as_ref())
+        .and_then(|p| p.providers.as_ref())
+    {
         match overrides.clone().try_into::<BTreeMap<String, Provider>>() {
             Ok(provs) => {
                 for provider in provs.values() {
@@ -82,7 +85,11 @@ pub struct HypotheticalCost {
     pub total_usd: f64,
 }
 
-pub fn hypothetical_cost(prompt_tokens: u64, gen_tokens: u64, price: &ModelPricing) -> HypotheticalCost {
+pub fn hypothetical_cost(
+    prompt_tokens: u64,
+    gen_tokens: u64,
+    price: &ModelPricing,
+) -> HypotheticalCost {
     let input_usd = prompt_tokens as f64 / 1_000_000.0 * price.input_per_mtok_usd;
     let output_usd = gen_tokens as f64 / 1_000_000.0 * price.output_per_mtok_usd;
     HypotheticalCost {
@@ -100,7 +107,10 @@ mod tests {
     fn defaults_have_all_frontier_models() {
         let table = load(None);
         for key in FRONTIER_MODELS {
-            assert!(table.get(key).is_some(), "frontier model {key} missing from defaults");
+            assert!(
+                table.get(key).is_some(),
+                "frontier model {key} missing from defaults"
+            );
         }
     }
 
@@ -116,7 +126,11 @@ mod tests {
             ("gemini-3-1-pro", 1.25, 10.00),
         ] {
             let p = table.get(key).unwrap();
-            assert_eq!((p.input_per_mtok_usd, p.output_per_mtok_usd), (input, output), "{key}");
+            assert_eq!(
+                (p.input_per_mtok_usd, p.output_per_mtok_usd),
+                (input, output),
+                "{key}"
+            );
         }
     }
 

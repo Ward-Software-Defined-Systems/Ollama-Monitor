@@ -14,13 +14,13 @@ pub fn compute(area: Rect) -> AppLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(6),  // loaded models
-            Constraint::Length(3),  // hardware (1 content row + border)
-            Constraint::Min(7),     // live feed (absorbs slack)
-            Constraint::Length(9),  // rolling metrics
-            Constraint::Length(7),  // hypothetical cost
-            Constraint::Length(1),  // footer
+            Constraint::Length(3), // header
+            Constraint::Length(6), // loaded models
+            Constraint::Length(3), // hardware (1 content row + border)
+            Constraint::Min(7),    // live feed (absorbs slack)
+            Constraint::Length(9), // rolling metrics
+            Constraint::Length(7), // hypothetical cost
+            Constraint::Length(1), // footer
         ])
         .split(area);
 

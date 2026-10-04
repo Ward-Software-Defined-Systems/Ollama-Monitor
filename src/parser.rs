@@ -56,9 +56,8 @@ pub fn classify(path: &str, content_type: Option<&str>) -> Option<Envelope> {
     let is_json = ct.contains("application/json");
 
     let openai_path = path.contains("/v1/chat/completions") || path.contains("/v1/completions");
-    let ollama_inference = path.contains("/api/chat")
-        || path.contains("/api/generate")
-        || path.contains("/api/embed");
+    let ollama_inference =
+        path.contains("/api/chat") || path.contains("/api/generate") || path.contains("/api/embed");
 
     if openai_path {
         return Some(if is_sse {
@@ -138,8 +137,10 @@ impl Accumulator {
     /// they see finish_reason — this is the window where the proxy should keep
     /// draining upstream so the record keeps real token counts.
     pub fn awaiting_usage_trailer(&self) -> bool {
-        matches!(self.envelope, Envelope::OpenAiSse | Envelope::OpenAiSseNoUsage)
-            && self.openai_finish_reason.is_some()
+        matches!(
+            self.envelope,
+            Envelope::OpenAiSse | Envelope::OpenAiSseNoUsage
+        ) && self.openai_finish_reason.is_some()
             && self.openai_usage.is_none()
     }
 
@@ -152,8 +153,9 @@ impl Accumulator {
 
         match self.envelope {
             Envelope::OllamaStream => self.ollama_done.map(|t| t.into_parsed(self.envelope)),
-            Envelope::OllamaSingle => parse_ollama_single(&self.buf)
-                .map(|t| t.into_parsed(Envelope::OllamaSingle)),
+            Envelope::OllamaSingle => {
+                parse_ollama_single(&self.buf).map(|t| t.into_parsed(Envelope::OllamaSingle))
+            }
             Envelope::OpenAiSse | Envelope::OpenAiSseNoUsage => {
                 if let Some(usage) = self.openai_usage {
                     let terminal = OpenAiTerminal {
@@ -176,11 +178,7 @@ impl Accumulator {
                             .openai_finish_reason
                             .unwrap_or_else(|| "unknown".to_string()),
                     };
-                    Some(terminal.into_parsed(
-                        Envelope::OpenAiSseNoUsage,
-                        wall_ttft,
-                        wall_total,
-                    ))
+                    Some(terminal.into_parsed(Envelope::OpenAiSseNoUsage, wall_ttft, wall_total))
                 } else {
                     None
                 }
@@ -255,7 +253,10 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 }
 
 fn trim_ascii(b: &[u8]) -> &[u8] {
-    let start = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(b.len());
+    let start = b
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(b.len());
     let end = b
         .iter()
         .rposition(|c| !c.is_ascii_whitespace())
@@ -326,8 +327,7 @@ impl OllamaTerminal {
             0.0
         };
         // First-token approximation: prompt-eval + load (load contributes only on cold start).
-        let ttft_sec =
-            ns_to_secs(self.prompt_eval_duration_ns) + ns_to_secs(self.load_duration_ns);
+        let ttft_sec = ns_to_secs(self.prompt_eval_duration_ns) + ns_to_secs(self.load_duration_ns);
         ParsedStats {
             model_id: self.model,
             prompt_tokens: self.prompt_tokens,
@@ -389,7 +389,12 @@ struct OpenAiTerminal {
 }
 
 impl OpenAiTerminal {
-    fn into_parsed(self, envelope: Envelope, wall_ttft: Duration, wall_total: Duration) -> ParsedStats {
+    fn into_parsed(
+        self,
+        envelope: Envelope,
+        wall_ttft: Duration,
+        wall_total: Duration,
+    ) -> ParsedStats {
         let total_secs = wall_total.as_secs_f64().max(0.0001);
         let (ttft_sec, gen_window) = match envelope {
             // SSE: wall_ttft is meaningful (time to first chunk); the gap to total is
@@ -485,9 +490,12 @@ mod tests {
     #[test]
     fn ollama_stream_extracts_final_chunk() {
         let body = concat!(
-            r#"{"model":"qwen3:14b","done":false}"#, "\n",
-            r#"{"model":"qwen3:14b","done":false,"response":"hi"}"#, "\n",
-            r#"{"model":"qwen3:14b","done":true,"done_reason":"stop","total_duration":2000000000,"load_duration":100000000,"prompt_eval_count":12,"prompt_eval_duration":300000000,"eval_count":80,"eval_duration":1500000000}"#, "\n"
+            r#"{"model":"qwen3:14b","done":false}"#,
+            "\n",
+            r#"{"model":"qwen3:14b","done":false,"response":"hi"}"#,
+            "\n",
+            r#"{"model":"qwen3:14b","done":true,"done_reason":"stop","total_duration":2000000000,"load_duration":100000000,"prompt_eval_count":12,"prompt_eval_duration":300000000,"eval_count":80,"eval_duration":1500000000}"#,
+            "\n"
         );
         let stats = parse_stream(Envelope::OllamaStream, body.as_bytes()).expect("stats");
         assert_eq!(stats.model_id, "qwen3:14b");

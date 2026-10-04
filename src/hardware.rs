@@ -13,7 +13,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -55,12 +54,13 @@ pub struct HardwareSnapshot {
 pub fn prime_sudo() {
     eprintln!("ollama-monitor needs sudo to run powermetrics for GPU/ANE telemetry.");
     eprintln!("(Skip with --no-tui to avoid the prompt.)");
-    let status = std::process::Command::new("sudo")
-        .args(["-v"])
-        .status();
+    let status = std::process::Command::new("sudo").args(["-v"]).status();
     match status {
         Ok(s) if s.success() => debug!("sudo -v cached credentials"),
-        Ok(s) => warn!("sudo -v exited with status {} — GPU/ANE may be unavailable", s),
+        Ok(s) => warn!(
+            "sudo -v exited with status {} — GPU/ANE may be unavailable",
+            s
+        ),
         Err(err) => warn!(error = %err, "sudo -v failed — GPU/ANE may be unavailable"),
     }
 }
@@ -130,7 +130,7 @@ fn collect_sysinfo(sys: &System) -> HardwareSnapshot {
     let mut ollama_count = 0usize;
     let mut ollama_cpu = 0f32;
     let mut ollama_rss = 0u64;
-    for (_pid, proc_) in sys.processes() {
+    for proc_ in sys.processes().values() {
         if !is_ollama_process(proc_) {
             continue;
         }
@@ -265,7 +265,7 @@ fn parse_ane_power(line: &str) -> Option<f32> {
         return None;
     }
     let after_colon = l.split_once(':').map(|(_, r)| r)?;
-    let value = after_colon.trim().split_whitespace().next()?;
+    let value = after_colon.split_whitespace().next()?;
     value.parse::<f32>().ok()
 }
 
@@ -318,8 +318,14 @@ mod tests {
 
     #[test]
     fn format_bytes_ratio_shares_one_unit() {
-        assert_eq!(format_bytes_ratio(38_200_000_000, 137_400_000_000), "38.2/137.4 GB");
-        assert_eq!(format_bytes_ratio(512_000_000, 137_400_000_000), "0.5/137.4 GB");
+        assert_eq!(
+            format_bytes_ratio(38_200_000_000, 137_400_000_000),
+            "38.2/137.4 GB"
+        );
+        assert_eq!(
+            format_bytes_ratio(512_000_000, 137_400_000_000),
+            "0.5/137.4 GB"
+        );
         assert_eq!(format_bytes_ratio(1_500_000, 8_000_000), "2/8 MB");
         assert_eq!(format_bytes_ratio(0, 0), "0/0 B");
     }
@@ -330,7 +336,10 @@ mod tests {
         sys.refresh_memory();
         let snap = collect_sysinfo(&sys);
         assert!(snap.system_mem_total_bytes > 0);
-        assert!(snap.system_mem_available_bytes > 0, "available memory should be sampled");
+        assert!(
+            snap.system_mem_available_bytes > 0,
+            "available memory should be sampled"
+        );
         assert!(snap.system_mem_available_bytes <= snap.system_mem_total_bytes);
     }
 
@@ -357,8 +366,15 @@ mod tests {
 
     #[test]
     fn parse_gpu_residency_variants() {
-        assert!((parse_gpu_active_residency("GPU HW active residency:   12.34% (...)").unwrap() - 12.34).abs() < 1e-3);
-        assert!((parse_gpu_active_residency("GPU active residency: 9.5%").unwrap() - 9.5).abs() < 1e-3);
+        assert!(
+            (parse_gpu_active_residency("GPU HW active residency:   12.34% (...)").unwrap()
+                - 12.34)
+                .abs()
+                < 1e-3
+        );
+        assert!(
+            (parse_gpu_active_residency("GPU active residency: 9.5%").unwrap() - 9.5).abs() < 1e-3
+        );
         assert!(parse_gpu_active_residency("System Average frequency: 1234 MHz").is_none());
     }
 
@@ -368,9 +384,4 @@ mod tests {
         assert!((parse_ane_power("ANE Power:0 mW").unwrap() - 0.0).abs() < 1e-3);
         assert!(parse_ane_power("CPU Power: 1500 mW").is_none());
     }
-}
-
-#[allow(dead_code)]
-pub fn _ensure_used() -> Result<()> {
-    Ok(())
 }

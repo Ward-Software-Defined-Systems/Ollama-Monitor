@@ -171,7 +171,8 @@ async fn handle(State(state): State<ProxyState>, req: Request) -> Result<Respons
         }),
     );
 
-    let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
     for (name, value) in upstream_headers.iter() {
         if is_hop_by_hop_str(name.as_str()) {
             continue;
@@ -187,12 +188,10 @@ async fn handle(State(state): State<ProxyState>, req: Request) -> Result<Respons
         }
     }
 
-    let resp = builder
-        .body(response_body)
-        .map_err(|err| {
-            warn!(error = %err, "failed to build response");
-            ProxyError::ResponseBuild
-        })?;
+    let resp = builder.body(response_body).map_err(|err| {
+        warn!(error = %err, "failed to build response");
+        ProxyError::ResponseBuild
+    })?;
 
     Ok(resp)
 }
@@ -436,18 +435,28 @@ mod tests {
 
     #[test]
     fn injects_include_usage_on_streaming_chat_completions() {
-        let body = Bytes::from(r#"{"model":"qwen3:14b","messages":[{"role":"user","content":"hi"}],"stream":true}"#);
+        let body = Bytes::from(
+            r#"{"model":"qwen3:14b","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        );
         let out = ensure_openai_include_usage("/v1/chat/completions", body);
         let v = val(&out);
-        assert_eq!(v["stream_options"]["include_usage"], serde_json::json!(true));
+        assert_eq!(
+            v["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
     fn preserves_existing_stream_options() {
-        let body = Bytes::from(r#"{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":false,"foo":"bar"}}"#);
+        let body = Bytes::from(
+            r#"{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":false,"foo":"bar"}}"#,
+        );
         let out = ensure_openai_include_usage("/v1/chat/completions", body);
         let v = val(&out);
-        assert_eq!(v["stream_options"]["include_usage"], serde_json::json!(true));
+        assert_eq!(
+            v["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
         assert_eq!(v["stream_options"]["foo"], serde_json::json!("bar"));
     }
 
@@ -483,7 +492,10 @@ mod tests {
         let body = Bytes::from(r#"{"model":"x","messages":[]}"#);
         let out = ensure_openai_include_usage("/v1/chat/completions", body);
         let v = val(&out);
-        assert_eq!(v["stream_options"]["include_usage"], serde_json::json!(true));
+        assert_eq!(
+            v["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
     }
 
     fn sse_frame(json: &str) -> Bytes {
@@ -506,17 +518,26 @@ mod tests {
         // Upstream: delta, finish_reason, then a cloud-relay-style delay before usage.
         let upstream = futures_util::stream::unfold(0u8, |step| async move {
             match step {
-                0 => Some((Ok::<Bytes, Infallible>(sse_frame(
-                    r#"{"model":"m","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
-                )), 1)),
-                1 => Some((Ok(sse_frame(
-                    r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-                )), 2)),
+                0 => Some((
+                    Ok::<Bytes, Infallible>(sse_frame(
+                        r#"{"model":"m","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+                    )),
+                    1,
+                )),
+                1 => Some((
+                    Ok(sse_frame(
+                        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                    )),
+                    2,
+                )),
                 2 => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    Some((Ok(sse_frame(
-                        r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7}}"#,
-                    )), 3))
+                    Some((
+                        Ok(sse_frame(
+                            r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7}}"#,
+                        )),
+                        3,
+                    ))
                 }
                 _ => None,
             }
@@ -542,9 +563,12 @@ mod tests {
         // Upstream: one delta, then hangs forever (generation still in progress).
         let upstream = futures_util::stream::unfold(0u8, |step| async move {
             match step {
-                0 => Some((Ok::<Bytes, Infallible>(sse_frame(
-                    r#"{"model":"m","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
-                )), 1)),
+                0 => Some((
+                    Ok::<Bytes, Infallible>(sse_frame(
+                        r#"{"model":"m","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+                    )),
+                    1,
+                )),
                 _ => {
                     std::future::pending::<()>().await;
                     None

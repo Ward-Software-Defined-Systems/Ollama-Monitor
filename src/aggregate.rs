@@ -104,7 +104,11 @@ where
     let p50 = percentile(&sorted, 0.50);
     let p95 = percentile(&sorted, 0.95);
 
-    let mean_ttft_sec = if count > 0 { ttft_sum / count as f64 } else { 0.0 };
+    let mean_ttft_sec = if count > 0 {
+        ttft_sum / count as f64
+    } else {
+        0.0
+    };
 
     WindowStats {
         request_count: count,

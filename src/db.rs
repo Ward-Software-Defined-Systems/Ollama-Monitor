@@ -175,7 +175,9 @@ fn open_and_migrate(path: &Path) -> Result<Connection> {
     )?;
 
     let current: Option<i32> = conn
-        .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| r.get(0))
+        .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
+            r.get(0)
+        })
         .ok();
     if current.is_none() {
         conn.execute(
@@ -234,13 +236,13 @@ mod tests {
     use super::*;
 
     fn temp_db_path() -> PathBuf {
+        // A counter, not the clock: macOS SystemTime only resolves microseconds, so
+        // tests running in parallel could otherwise share (and clobber) one file.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
             "ollama-monitor-test-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&p);
         p

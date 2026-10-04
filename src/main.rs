@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -114,8 +114,7 @@ async fn async_main(
     // signal handling -> shutdown
     let shutdown_for_signals = shutdown_tx.clone();
     tokio::spawn(async move {
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
         info!("signal handlers installed (SIGTERM, SIGINT)");
         tokio::select! {
@@ -153,7 +152,9 @@ async fn async_main(
     let _ = shutdown_tx.send(true);
 
     // Wait up to 3s for workers to drain; abort whoever's left so we never hang.
-    let join_all = async { let _ = tokio::join!(poller, proxy, hw); };
+    let join_all = async {
+        let _ = tokio::join!(poller, proxy, hw);
+    };
     if tokio::time::timeout(std::time::Duration::from_secs(3), join_all)
         .await
         .is_err()
@@ -202,7 +203,10 @@ async fn run_headless(
     Ok(())
 }
 
-fn init_tracing(log_path: &PathBuf, allow_stderr: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+fn init_tracing(
+    log_path: &Path,
+    allow_stderr: bool,
+) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let parent = log_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("log path has no parent: {}", log_path.display()))?;
@@ -216,7 +220,8 @@ fn init_tracing(log_path: &PathBuf, allow_stderr: bool) -> Result<tracing_append
     );
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    let env = EnvFilter::try_from_env("OLLAMA_MONITOR_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let env =
+        EnvFilter::try_from_env("OLLAMA_MONITOR_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
 
     let file_layer = fmt::layer()
         .with_writer(file_writer)

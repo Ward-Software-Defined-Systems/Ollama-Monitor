@@ -230,8 +230,9 @@ pub fn merge_models(tags: Vec<TagModel>, ps: Vec<LoadedModel>) -> Vec<ModelInfo>
                 non_empty(details.and_then(|d| d.format.as_ref()))
                     .or_else(|| non_empty(resident_details.and_then(|d| d.format.as_ref())))
             },
-            quantization: non_empty(details.and_then(|d| d.quantization_level.as_ref()))
-                .or_else(|| non_empty(resident_details.and_then(|d| d.quantization_level.as_ref()))),
+            quantization: non_empty(details.and_then(|d| d.quantization_level.as_ref())).or_else(
+                || non_empty(resident_details.and_then(|d| d.quantization_level.as_ref())),
+            ),
             max_context_length: details
                 .and_then(|d| d.context_length)
                 .or_else(|| resident.and_then(|p| p.context_length)),
@@ -262,7 +263,9 @@ pub fn merge_models(tags: Vec<TagModel>, ps: Vec<LoadedModel>) -> Vec<ModelInfo>
                 non_empty(details.and_then(|d| d.format.as_ref()))
             },
             quantization: non_empty(details.and_then(|d| d.quantization_level.as_ref())),
-            max_context_length: p.context_length.or_else(|| details.and_then(|d| d.context_length)),
+            max_context_length: p
+                .context_length
+                .or_else(|| details.and_then(|d| d.context_length)),
             state: if cloud { "cloud" } else { "loaded" }.into(),
             id,
         });
@@ -337,9 +340,15 @@ pub fn canonical_model_name(name: &str) -> String {
 
 /// The panel row a captured record's `model_id` refers to: an exact (case-insensitive)
 /// id match wins, otherwise the first canonical match in display order.
-pub fn resolve_model_id<'a>(models: &'a [ModelInfo], record_model: Option<&str>) -> Option<&'a str> {
+pub fn resolve_model_id<'a>(
+    models: &'a [ModelInfo],
+    record_model: Option<&str>,
+) -> Option<&'a str> {
     let record_model = record_model?;
-    if let Some(m) = models.iter().find(|m| m.id.eq_ignore_ascii_case(record_model)) {
+    if let Some(m) = models
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(record_model))
+    {
         return Some(&m.id);
     }
     let want = canonical_model_name(record_model);
@@ -357,7 +366,9 @@ mod tests {
     const PS_FIXTURE: &str = include_str!("../fixtures/api-ps.json");
 
     fn tags_fixture() -> Vec<TagModel> {
-        serde_json::from_str::<TagsResp>(TAGS_CLOUD_FIXTURE).unwrap().models
+        serde_json::from_str::<TagsResp>(TAGS_CLOUD_FIXTURE)
+            .unwrap()
+            .models
     }
 
     fn ps_fixture() -> Vec<LoadedModel> {
@@ -421,7 +432,12 @@ mod tests {
         assert_eq!(p.models[0].name, "qwen3:14b");
         assert_eq!(p.models[0].context_length, Some(4096));
         assert_eq!(
-            p.models[0].details.as_ref().unwrap().quantization_level.as_deref(),
+            p.models[0]
+                .details
+                .as_ref()
+                .unwrap()
+                .quantization_level
+                .as_deref(),
             Some("Q4_K_M")
         );
     }
@@ -432,7 +448,10 @@ mod tests {
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].name, "qwen3:14b");
         assert_eq!(ps[0].context_length, Some(4096));
-        assert_eq!(ps[0].details.as_ref().unwrap().format.as_deref(), Some("gguf"));
+        assert_eq!(
+            ps[0].details.as_ref().unwrap().format.as_deref(),
+            Some("gguf")
+        );
     }
 
     #[test]
@@ -460,9 +479,27 @@ mod tests {
     #[test]
     fn merge_local_loaded_and_embedding() {
         let tags = vec![
-            tag("nomic-embed-text:latest", "gguf", "F16", Some(2048), &["embedding"]),
-            tag("qwen3:14b", "gguf", "Q4_K_M", None, &["completion", "tools"]),
-            tag("llava:7b", "gguf", "Q4_0", Some(4096), &["completion", "vision"]),
+            tag(
+                "nomic-embed-text:latest",
+                "gguf",
+                "F16",
+                Some(2048),
+                &["embedding"],
+            ),
+            tag(
+                "qwen3:14b",
+                "gguf",
+                "Q4_K_M",
+                None,
+                &["completion", "tools"],
+            ),
+            tag(
+                "llava:7b",
+                "gguf",
+                "Q4_0",
+                Some(4096),
+                &["completion", "vision"],
+            ),
         ];
         let rows = merge_models(tags, ps_fixture());
         let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
@@ -521,7 +558,11 @@ mod tests {
             ..Default::default()
         }];
         let rows = merge_models(tags_fixture(), ps);
-        assert_eq!(rows.len(), 1, "ps entry must merge into the tags row, not duplicate it");
+        assert_eq!(
+            rows.len(),
+            1,
+            "ps entry must merge into the tags row, not duplicate it"
+        );
         assert_eq!(rows[0].state, "cloud");
     }
 
@@ -544,8 +585,14 @@ mod tests {
             ("Qwen3:14B", "qwen3:14b"),
             ("  qwen3:14b ", "qwen3:14b"),
             ("qwen3:", "qwen3"),
-            ("registry.local:5000/ns/model", "registry.local:5000/ns/model"),
-            ("registry.local:5000/ns/model:latest", "registry.local:5000/ns/model"),
+            (
+                "registry.local:5000/ns/model",
+                "registry.local:5000/ns/model",
+            ),
+            (
+                "registry.local:5000/ns/model:latest",
+                "registry.local:5000/ns/model",
+            ),
         ] {
             assert_eq!(canonical_model_name(input), want, "input {input:?}");
         }
@@ -553,23 +600,42 @@ mod tests {
 
     #[test]
     fn resolve_prefers_exact_then_canonical() {
-        let models = vec![info("gpt-oss:120b-cloud", "cloud"), info("gpt-oss:120b", "loaded")];
-        assert_eq!(resolve_model_id(&models, Some("gpt-oss:120b")), Some("gpt-oss:120b"));
-        assert_eq!(resolve_model_id(&models, Some("GPT-OSS:120B")), Some("gpt-oss:120b"));
+        let models = vec![
+            info("gpt-oss:120b-cloud", "cloud"),
+            info("gpt-oss:120b", "loaded"),
+        ];
+        assert_eq!(
+            resolve_model_id(&models, Some("gpt-oss:120b")),
+            Some("gpt-oss:120b")
+        );
+        assert_eq!(
+            resolve_model_id(&models, Some("GPT-OSS:120B")),
+            Some("gpt-oss:120b")
+        );
 
-        let models = vec![info("deepseek-v4-pro:cloud", "cloud"), info("qwen3:latest", "not-loaded")];
+        let models = vec![
+            info("deepseek-v4-pro:cloud", "cloud"),
+            info("qwen3:latest", "not-loaded"),
+        ];
         assert_eq!(
             resolve_model_id(&models, Some("deepseek-v4-pro")),
             Some("deepseek-v4-pro:cloud")
         );
-        assert_eq!(resolve_model_id(&models, Some("qwen3")), Some("qwen3:latest"));
+        assert_eq!(
+            resolve_model_id(&models, Some("qwen3")),
+            Some("qwen3:latest")
+        );
         assert_eq!(resolve_model_id(&models, Some("llama3")), None);
         assert_eq!(resolve_model_id(&models, None), None);
     }
 
     #[test]
     fn snapshot_from_partial_failure() {
-        match snapshot_from(Some("0.35.0".into()), Ok(tags_fixture()), Err("/api/ps: boom".into())) {
+        match snapshot_from(
+            Some("0.35.0".into()),
+            Ok(tags_fixture()),
+            Err("/api/ps: boom".into()),
+        ) {
             ModelsSnapshot::Loaded { version, models } => {
                 assert_eq!(version.as_deref(), Some("0.35.0"));
                 assert_eq!(models.len(), 1);

@@ -210,9 +210,7 @@ async fn run_loop(
         // Redraw after every event (as LMS-Monitor does), not just on the tick, so a busy
         // record stream can't starve the screen; the tick keeps the clock moving.
         state.now = Utc::now();
-        terminal
-            .draw(|f| render(f, state))
-            .context("draw")?;
+        terminal.draw(|f| render(f, state)).context("draw")?;
 
         tokio::select! {
             biased;
@@ -249,7 +247,9 @@ fn handle_input(event: Event, state: &mut AppState, shutdown_tx: &watch::Sender<
             let _ = shutdown_tx.send(true);
             return true;
         }
-        KeyCode::Char('c') | KeyCode::Char('C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             let _ = shutdown_tx.send(true);
             return true;
         }
@@ -435,10 +435,16 @@ mod tests {
             "rolling metrics",
             "hypothetical session cost",
         ] {
-            assert!(lines.iter().any(|l| l.contains(title)), "panel {title:?} missing");
+            assert!(
+                lines.iter().any(|l| l.contains(title)),
+                "panel {title:?} missing"
+            );
         }
         let hw_row = line_with(&lines, "ollama cpu");
-        assert!(hw_row.contains("ane  234 mW"), "hardware row clipped: {hw_row}");
+        assert!(
+            hw_row.contains("ane  234 mW"),
+            "hardware row clipped: {hw_row}"
+        );
         assert!(lines.last().unwrap().contains("q quit"), "footer missing");
     }
 
@@ -451,7 +457,11 @@ mod tests {
             "{}",
             lines[0]
         );
-        assert!(lines[1].contains("server: ● reachable (http://127.0.0.1:11434)"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("server: ● reachable (http://127.0.0.1:11434)"),
+            "{}",
+            lines[1]
+        );
     }
 
     #[test]
@@ -462,7 +472,10 @@ mod tests {
         for cell in ["llm", "cloud", "FP8", "1048576"] {
             assert!(row.contains(cell), "missing {cell:?}: {row}");
         }
-        assert!(!lines.iter().any(|l| l.contains('▸')), "no marker before any inference");
+        assert!(
+            !lines.iter().any(|l| l.contains('▸')),
+            "no marker before any inference"
+        );
 
         // OpenAI-compat responses name the model without the `:cloud` tag.
         state.ingest_record(record("deepseek-v4-pro", "openai-sse"));
@@ -505,7 +518,10 @@ mod tests {
         state.ingest_record(rec);
         let lines = render_to_lines(120, 36, &state);
         let header = line_with(&lines, "claude-fable-5");
-        assert!(header.contains("claude-opus-4-8") && header.contains("gemini-3-1-pro"), "{header}");
+        assert!(
+            header.contains("claude-opus-4-8") && header.contains("gemini-3-1-pro"),
+            "{header}"
+        );
         let total = line_with(&lines, "total USD");
         for usd in ["$60.0000", "$30.0000", "$11.2500"] {
             assert!(total.contains(usd), "missing {usd}: {total}");
@@ -547,7 +563,10 @@ mod tests {
         });
         let lines = render_to_lines(160, 36, &state);
         let header = line_with(&lines, "● unreachable");
-        assert!(header.contains("err: /api/version: Connection refused"), "{header}");
+        assert!(
+            header.contains("err: /api/version: Connection refused"),
+            "{header}"
+        );
         // The last-known list and version survive a blip.
         line_with(&lines, "deepseek-v4-pro:cloud");
         assert!(lines[0].contains("v0.35.0"), "{}", lines[0]);
@@ -563,15 +582,27 @@ mod tests {
         // Wide enough that the header clock isn't clipped.
         let lines = render_to_lines(200, 36, &state);
 
-        let local_clock = state.now.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string();
+        let local_clock = state
+            .now
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         let local_feed = feed_local(&state.feed[0]);
         line_with(&lines, &local_clock);
         line_with(&lines, &local_feed);
 
-        let offset = state.now.with_timezone(&Local).offset().fix().local_minus_utc();
+        let offset = state
+            .now
+            .with_timezone(&Local)
+            .offset()
+            .fix()
+            .local_minus_utc();
         if offset != 0 {
             let screen = lines.join("\n");
-            assert!(!screen.contains("2026-01-02 03:04:05"), "clock rendered in UTC");
+            assert!(
+                !screen.contains("2026-01-02 03:04:05"),
+                "clock rendered in UTC"
+            );
             assert!(!screen.contains("03:00:09"), "feed rendered in UTC");
         }
     }
@@ -596,7 +627,10 @@ mod tests {
         approx.gen_tokens = 37;
         state.ingest_record(approx);
         for (w, h) in [(120, 36), (160, 44)] {
-            println!("--- {w}x{h} ---\n{}", render_to_lines(w, h, &state).join("\n"));
+            println!(
+                "--- {w}x{h} ---\n{}",
+                render_to_lines(w, h, &state).join("\n")
+            );
         }
     }
 

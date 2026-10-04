@@ -75,7 +75,9 @@ pub fn render_header(f: &mut Frame, area: Rect, info: HeaderInfo<'_>) {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
             "[PAUSED]",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::raw("   lifetime: "));
@@ -159,7 +161,10 @@ pub fn render_models(
                     m.max_context_length
                         .map_or("-".to_string(), |c| c.to_string()),
                 ),
-                Cell::from(Span::styled(m.state.clone(), Style::default().fg(state_color))),
+                Cell::from(Span::styled(
+                    m.state.clone(),
+                    Style::default().fg(state_color),
+                )),
             ])
         })
         .collect();
@@ -172,9 +177,11 @@ pub fn render_models(
         Constraint::Length(10),
         Constraint::Length(12),
     ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title("loaded models"));
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("loaded models"),
+    );
     f.render_widget(table, area);
 }
 
@@ -200,8 +207,16 @@ pub fn render_feed(f: &mut Frame, area: Rect, feed: &VecDeque<InferenceRecord>) 
         .map(|r| {
             // Cloud-proxy fallback (ollama/ollama#15169): no `usage` block arrived, so gen
             // and tok/s are chunk-count estimates. A leading `~` flags them at a glance.
-            let approx = if r.envelope == APPROX_ENVELOPE { "~" } else { "" };
-            let stop = if r.stop_reason.is_empty() { "-" } else { r.stop_reason.as_str() };
+            let approx = if r.envelope == APPROX_ENVELOPE {
+                "~"
+            } else {
+                ""
+            };
+            let stop = if r.stop_reason.is_empty() {
+                "-"
+            } else {
+                r.stop_reason.as_str()
+            };
             Row::new(vec![
                 Cell::from(feed_time(r, &chrono::Local)),
                 Cell::from(truncate(&r.model_id, 28).to_string()),
@@ -236,7 +251,10 @@ pub fn feed_time<Tz: TimeZone>(r: &InferenceRecord, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
-    r.completed_at.with_timezone(tz).format("%H:%M:%S").to_string()
+    r.completed_at
+        .with_timezone(tz)
+        .format("%H:%M:%S")
+        .to_string()
 }
 
 pub fn render_rolling(f: &mut Frame, area: Rect, snap: &AggregateSnapshot) {
@@ -276,7 +294,11 @@ pub fn render_rolling(f: &mut Frame, area: Rect, snap: &AggregateSnapshot) {
         metric_row("gen tok", |m| m.gen_tokens.to_string(), snap),
         metric_row("mean tok/s", |m| format!("{:.1}", m.mean_tps), snap),
         metric_row("p95 tok/s", |m| format!("{:.1}", m.p95_tps), snap),
-        metric_row("mean TTFT", |m| format!("{:.0}ms", m.mean_ttft_sec * 1000.0), snap),
+        metric_row(
+            "mean TTFT",
+            |m| format!("{:.0}ms", m.mean_ttft_sec * 1000.0),
+            snap,
+        ),
     ];
 
     let widths = [
@@ -286,22 +308,15 @@ pub fn render_rolling(f: &mut Frame, area: Rect, snap: &AggregateSnapshot) {
         Constraint::Length(12),
         Constraint::Length(12),
     ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("rolling metrics"),
-        );
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("rolling metrics"),
+    );
     f.render_widget(table, area);
 }
 
-pub fn render_costs(
-    f: &mut Frame,
-    area: Rect,
-    snap: &AggregateSnapshot,
-    pricing: &PricingTable,
-) {
+pub fn render_costs(f: &mut Frame, area: Rect, snap: &AggregateSnapshot, pricing: &PricingTable) {
     let mut header_cells: Vec<Cell> = vec![Cell::from("")];
     for key in FRONTIER_MODELS {
         header_cells.push(Cell::from(*key));
@@ -318,7 +333,11 @@ pub fn render_costs(
 
     let costs: Vec<_> = FRONTIER_MODELS
         .iter()
-        .map(|k| pricing.get(k).map(|p| hypothetical_cost(total_prompt, total_gen, &p)))
+        .map(|k| {
+            pricing
+                .get(k)
+                .map(|p| hypothetical_cost(total_prompt, total_gen, &p))
+        })
         .collect();
 
     fn cost_cell(c: &Option<HypotheticalCost>, sel: fn(&HypotheticalCost) -> f64) -> Cell<'static> {
@@ -346,20 +365,15 @@ pub fn render_costs(
     let rows = vec![
         row("input USD", &costs, |c| c.input_usd),
         row("output USD", &costs, |c| c.output_usd),
-        row(
-            "total USD",
-            &costs,
-            |c| c.total_usd,
-        ),
+        row("total USD", &costs, |c| c.total_usd),
     ];
 
     let mut widths = vec![Constraint::Length(14)];
     for _ in FRONTIER_MODELS {
         widths.push(Constraint::Min(14));
     }
-    let title = format!(
-        "hypothetical session cost  (prompt={total_prompt} tok / gen={total_gen} tok)"
-    );
+    let title =
+        format!("hypothetical session cost  (prompt={total_prompt} tok / gen={total_gen} tok)");
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -411,7 +425,11 @@ fn hardware_line(hw: &HardwareSnapshot) -> Line<'static> {
             Span::raw(format!(
                 "  {} proc{}",
                 hw.ollama_process_count,
-                if hw.ollama_process_count == 1 { "" } else { "s" }
+                if hw.ollama_process_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             )),
         ]);
     }
@@ -426,7 +444,11 @@ fn hardware_line(hw: &HardwareSnapshot) -> Line<'static> {
     spans.push(match hw.ane_power_mw {
         Some(mw) => Span::styled(
             format!("{mw:>4.0} mW"),
-            Style::default().fg(if mw > 100.0 { Color::Yellow } else { Color::Green }),
+            Style::default().fg(if mw > 100.0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            }),
         ),
         None => Span::styled(" n/a", dim),
     });
@@ -536,7 +558,10 @@ mod tests {
         let line = hardware_line(&hw);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("ollama no process detected"), "{text:?}");
-        assert!(!text.contains("rss"), "rss should be omitted without a process: {text:?}");
+        assert!(
+            !text.contains("rss"),
+            "rss should be omitted without a process: {text:?}"
+        );
         assert!(text.contains("gpu   n/a"), "{text:?}");
         assert!(text.contains("ane  n/a"), "{text:?}");
     }
