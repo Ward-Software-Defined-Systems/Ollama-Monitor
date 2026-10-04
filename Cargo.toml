@@ -3,7 +3,7 @@ name = "ollama-monitor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Passive observer for a local Ollama instance: live request feed, rolling tok/s, hypothetical frontier-API cost, and hardware telemetry in a TUI."
+description = "Terminal dashboard for a local Ollama: a transparent proxy that records each request's tokens, TTFT and throughput, prices them at frontier-API rates, and shows Apple Silicon hardware telemetry."
 license = "MIT"
 repository = "https://github.com/Ward-Software-Defined-Systems/Ollama-Monitor"
 
@@ -17,12 +17,6 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP — reverse proxy
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "macros"] }
-hyper = { version = "1", features = ["http1", "client", "server"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "server-auto"] }
-http = "1"
-http-body = "1"
-http-body-util = "0.1"
-tower = "0.5"
 bytes = "1"
 futures-util = "0.3"
 tokio-stream = "0.1"
@@ -58,7 +52,6 @@ tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros"] }

@@ -48,6 +48,18 @@ pub struct ParsedStats {
     pub envelope: Envelope,
 }
 
+impl ParsedStats {
+    /// Ollama answers a model load or unload (an empty prompt, or `keep_alive: 0`) with a
+    /// `done: true` record that carries no tokens. It isn't an inference; the proxy
+    /// doesn't record it.
+    pub fn is_load_or_unload(&self) -> bool {
+        matches!(
+            self.envelope,
+            Envelope::OllamaStream | Envelope::OllamaSingle
+        ) && matches!(self.stop_reason.as_str(), "load" | "unload")
+    }
+}
+
 /// Pick the envelope from the request URL path and the response Content-Type header.
 pub fn classify(path: &str, content_type: Option<&str>) -> Option<Envelope> {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
@@ -56,8 +68,8 @@ pub fn classify(path: &str, content_type: Option<&str>) -> Option<Envelope> {
     let is_json = ct.contains("application/json");
 
     let openai_path = path.contains("/v1/chat/completions") || path.contains("/v1/completions");
-    let ollama_inference =
-        path.contains("/api/chat") || path.contains("/api/generate") || path.contains("/api/embed");
+    // Embeddings (/api/embed) carry no generation stats, so they pass through untracked.
+    let ollama_inference = path.contains("/api/chat") || path.contains("/api/generate");
 
     if openai_path {
         return Some(if is_sse {
@@ -485,6 +497,23 @@ mod tests {
             Some(Envelope::OpenAiSingle)
         );
         assert_eq!(classify("/api/tags", Some("application/json")), None);
+        assert_eq!(classify("/api/embed", Some("application/json")), None);
+        assert_eq!(classify("/api/embeddings", Some("application/json")), None);
+    }
+
+    #[test]
+    fn load_and_unload_calls_are_flagged() {
+        let load = "{\"model\":\"qwen3:14b\",\"created_at\":\"2026-10-04T15:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done_reason\":\"load\",\"done\":true}\n";
+        let stats = parse_stream(Envelope::OllamaStream, load.as_bytes()).expect("stats");
+        assert!(stats.is_load_or_unload());
+
+        let unload = r#"{"model":"qwen3:14b","created_at":"2026-10-04T15:00:00Z","response":"","done":true,"done_reason":"unload"}"#;
+        let stats = parse_stream(Envelope::OllamaSingle, unload.as_bytes()).expect("stats");
+        assert!(stats.is_load_or_unload());
+
+        let real = include_bytes!("../fixtures/ollama-chat-nonstream.json");
+        let stats = parse_stream(Envelope::OllamaSingle, real).expect("stats");
+        assert!(!stats.is_load_or_unload());
     }
 
     #[test]

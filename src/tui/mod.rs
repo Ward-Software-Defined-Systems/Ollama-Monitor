@@ -523,7 +523,7 @@ mod tests {
             "{header}"
         );
         let total = line_with(&lines, "total USD");
-        for usd in ["$60.0000", "$30.0000", "$11.2500"] {
+        for usd in ["$60.0000", "$30.0000", "$14.0000"] {
             assert!(total.contains(usd), "missing {usd}: {total}");
         }
         line_with(&lines, "(prompt=1000000 tok / gen=1000000 tok)");

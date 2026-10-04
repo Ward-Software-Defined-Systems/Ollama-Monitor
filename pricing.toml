@@ -1,9 +1,10 @@
 # Hypothetical frontier-API pricing per 1M tokens, USD.
-# List prices, updated 2026-10-03; kept identical to lmstudio-monitor's table.
-# Override with: ~/Library/Application Support/ollama-monitor/config.toml
-#   [pricing.providers.anthropic.models.claude-opus-4-8]
+# List prices, updated 2026-10-04; kept identical to lmstudio-monitor's table.
+# Override in ~/Library/Application Support/ollama-monitor/config.toml, e.g. to use
+# Gemini's rate for prompts over 200K tokens:
+#   [pricing.providers.google.models.gemini-3-1-pro]
 #   input_per_mtok_usd  = 4.00
-#   output_per_mtok_usd = 20.00
+#   output_per_mtok_usd = 18.00
 
 [providers.anthropic.models.claude-fable-5-1]
 input_per_mtok_usd  = 10.00
@@ -26,5 +27,5 @@ input_per_mtok_usd  = 5.00
 output_per_mtok_usd = 25.00
 
 [providers.google.models.gemini-3-1-pro]
-input_per_mtok_usd  = 1.25
-output_per_mtok_usd = 10.00
+input_per_mtok_usd  = 2.00
+output_per_mtok_usd = 12.00

@@ -19,7 +19,9 @@ pub struct InferenceRecord {
     pub total_time_sec: f64,
     pub stop_reason: String,
     pub completed_at: DateTime<Utc>,
-    pub envelope: String, // "ollama-stream" / "ollama-single" / "openai-sse" / "openai-single"
+    /// `parser::Envelope::as_str()`: "ollama-stream", "ollama-single", "openai-sse",
+    /// "openai-single", or "openai-sse-approx" for estimated counts.
+    pub envelope: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -69,7 +71,8 @@ impl DbHandle {
         rx.await?
     }
 
-    /// Open a fresh read-only connection. Used by the lifetime-totals poller.
+    /// Open a second connection for the lifetime-totals poller. It's an ordinary
+    /// read-write connection that only ever reads; the writer task stays the only writer.
     pub fn open_reader(&self) -> Result<Connection> {
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("open reader for {}", self.db_path.display()))?;

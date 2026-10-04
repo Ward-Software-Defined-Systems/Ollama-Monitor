@@ -123,7 +123,7 @@ mod tests {
             ("claude-opus-5-5", 4.00, 20.00),
             ("claude-opus-5", 5.00, 25.00),
             ("claude-opus-4-8", 5.00, 25.00),
-            ("gemini-3-1-pro", 1.25, 10.00),
+            ("gemini-3-1-pro", 2.00, 12.00),
         ] {
             let p = table.get(key).unwrap();
             assert_eq!(

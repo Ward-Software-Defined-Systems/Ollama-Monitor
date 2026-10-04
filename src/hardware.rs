@@ -6,8 +6,10 @@
 //!    active residency and ANE power. The sudo prompt is taken BEFORE TUI raw mode so
 //!    the user can type their password into a normal cooked terminal.
 //!
-//! On shutdown the powermetrics child receives SIGTERM via libc::kill so it doesn't
-//! orphan as root.
+//! The sudo child gets no stdin and its own process group, so it never touches the TUI's
+//! terminal (see `spawn_powermetrics`). On shutdown it receives SIGTERM via libc::kill,
+//! which sudo relays to powermetrics, so nothing orphans as root. If powermetrics exits
+//! on its own, GPU/ANE drop back to n/a.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, watch};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(2000);
 
@@ -31,8 +33,10 @@ const OLLAMA_PATH_HINTS: &[&str] = &[
     "/.ollama/",
 ];
 
-/// Name-based fallback (matched on `Process::name()` exact-or-prefix).
-const OLLAMA_NAME_HINTS: &[&str] = &["ollama", "ollama runner"];
+/// Name-based fallback, matched exactly against `Process::name()`: the executable name,
+/// `ollama` for the server and its runners alike. Deliberately not a prefix match, which
+/// would count `ollama-monitor` itself.
+const OLLAMA_NAME_HINTS: &[&str] = &["ollama"];
 
 #[derive(Debug, Clone, Default)]
 pub struct HardwareSnapshot {
@@ -185,8 +189,16 @@ async fn spawn_powermetrics(
         "-i",
         "2000",
     ]);
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
+    // Keep sudo off the TUI's terminal. sudo >= 1.9.14 defaults to use_pty, and a sudo in
+    // the terminal's foreground process group may read terminal input to relay to its
+    // command, competing with crossterm for keystrokes. With no stdin and its own process
+    // group it never reads from or reconfigures our terminal. Safe only because of -n: a
+    // background sudo that prompted would stop on SIGTTIN. Not setsid: sudo's cached
+    // credentials are tied to the terminal session.
+    cmd.process_group(0);
     cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
@@ -213,11 +225,13 @@ async fn spawn_powermetrics(
                             apply_pm_line(&line, &last).await;
                         }
                         Ok(None) => {
-                            info!("powermetrics stdout closed");
+                            warn!("powermetrics exited; GPU/ANE will show n/a");
+                            clear_pm(&last).await;
                             return;
                         }
                         Err(err) => {
-                            warn!(error = %err, "powermetrics read error");
+                            warn!(error = %err, "powermetrics read failed; GPU/ANE will show n/a");
+                            clear_pm(&last).await;
                             return;
                         }
                     }
@@ -227,6 +241,14 @@ async fn spawn_powermetrics(
     });
 
     Some(child)
+}
+
+/// Forget the last GPU/ANE readings once powermetrics is gone, so the panel shows n/a
+/// instead of numbers frozen at their final values.
+async fn clear_pm(last: &Mutex<HardwareSnapshot>) {
+    let mut g = last.lock().await;
+    g.gpu_active_residency_pct = None;
+    g.ane_power_mw = None;
 }
 
 async fn apply_pm_line(line: &str, last: &Mutex<HardwareSnapshot>) {

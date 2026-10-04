@@ -49,9 +49,8 @@ pub struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = config::resolve_paths(&cli)?;
-    let user_config = config::load_user_config(&paths.config_file)?;
-    let pricing = pricing::load(user_config.as_ref());
 
+    // Logging first, so warnings from loading the config and pricing reach the log.
     let log_writer = init_tracing(&paths.log_file, cli.no_tui)?;
     info!(
         proxy = %cli.proxy_listen,
@@ -60,6 +59,13 @@ fn main() -> Result<()> {
         log = %paths.log_file.display(),
         "ollama-monitor starting"
     );
+    let user_config = config::load_user_config(&paths.config_file)?;
+    let pricing = pricing::load(user_config.as_ref());
+
+    // Claim the proxy port before the sudo prompt and the TUI: a taken port or a bad
+    // address should stop us here, not leave a dashboard with nothing behind it.
+    let listener = proxy::bind(&cli.proxy_listen)
+        .inspect_err(|err| tracing::error!("proxy could not start: {err:#}"))?;
 
     if !cli.no_tui {
         // Take the sudo prompt BEFORE entering raw mode; it needs a cooked terminal.
@@ -70,7 +76,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    let result = runtime.block_on(async_main(cli, paths, pricing));
+    let result = runtime.block_on(async_main(cli, paths, pricing, listener));
 
     runtime.shutdown_background();
     drop(log_writer);
@@ -81,6 +87,7 @@ async fn async_main(
     cli: Cli,
     paths: config::Paths,
     pricing: Arc<pricing::PricingTable>,
+    listener: std::net::TcpListener,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -89,27 +96,20 @@ async fn async_main(
     info!(session_id, "db opened, session started");
 
     let (records_tx, records_rx) = mpsc::channel::<InferenceRecord>(256);
-    let (models_tx, models_rx) = mpsc::channel::<ModelsSnapshot>(8);
-    let (hw_tx, hw_rx) = mpsc::channel::<HardwareSnapshot>(8);
-
-    // poller
-    let poller = tokio::spawn(api::poll_models(
-        cli.ollama_url.clone(),
-        models_tx,
-        shutdown_rx.clone(),
-    ));
 
     // proxy
-    let proxy = tokio::spawn(proxy::serve(
-        cli.proxy_listen.clone(),
+    let serve = proxy::serve(
+        listener,
         cli.ollama_url.clone(),
         session_id,
         records_tx.clone(),
         shutdown_rx.clone(),
-    ));
-
-    // hardware sampler
-    let hw = tokio::spawn(hardware::sample(hw_tx, shutdown_rx.clone()));
+    );
+    let mut workers = vec![tokio::spawn(async move {
+        if let Err(err) = serve.await {
+            tracing::error!("proxy stopped: {err:#}");
+        }
+    })];
 
     // signal handling -> shutdown
     let shutdown_for_signals = shutdown_tx.clone();
@@ -127,12 +127,18 @@ async fn async_main(
     });
 
     if cli.no_tui {
-        // Headless has no models/hardware panels; drop the receivers so the poller and
-        // sampler exit on their next send instead of blocking on a full channel.
-        drop(models_rx);
-        drop(hw_rx);
+        // Headless has no models or hardware panels, so the poller and the sampler (with
+        // its sudo powermetrics) never start.
         run_headless(records_rx, db_handle.clone(), shutdown_rx.clone()).await?;
     } else {
+        let (models_tx, models_rx) = mpsc::channel::<ModelsSnapshot>(8);
+        let (hw_tx, hw_rx) = mpsc::channel::<HardwareSnapshot>(8);
+        workers.push(tokio::spawn(api::poll_models(
+            cli.ollama_url.clone(),
+            models_tx,
+            shutdown_rx.clone(),
+        )));
+        workers.push(tokio::spawn(hardware::sample(hw_tx, shutdown_rx.clone())));
         tui::run(
             session_id,
             records_rx,
@@ -151,13 +157,14 @@ async fn async_main(
     info!("ui exited; broadcasting shutdown to workers");
     let _ = shutdown_tx.send(true);
 
-    // Wait up to 3s for workers to drain; abort whoever's left so we never hang.
-    let join_all = async {
-        let _ = tokio::join!(poller, proxy, hw);
-    };
-    if tokio::time::timeout(std::time::Duration::from_secs(3), join_all)
-        .await
-        .is_err()
+    // Give workers up to 3s to drain. Whoever's left is dropped along with the runtime
+    // (shutdown_background in main), so we never hang.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures_util::future::join_all(workers),
+    )
+    .await
+    .is_err()
     {
         tracing::warn!("workers did not exit within 3s; forcing shutdown");
     }

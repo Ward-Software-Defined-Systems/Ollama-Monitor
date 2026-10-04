@@ -1,13 +1,16 @@
 //! HTTP reverse proxy in front of Ollama.
 //!
-//! - Listens on `--proxy-listen`, forwards every request to `--ollama-url`.
-//! - Streams the request body to upstream and the response body to the client without
-//!   buffering: clients see no added latency.
-//! - For inference paths (`/api/chat`, `/api/generate`, `/v1/chat/completions`),
-//!   tees each response chunk into `parser::Accumulator`. When the body finishes,
-//!   the accumulator is finalized and an `InferenceRecord` is sent to `records_tx`.
-//! - Parser failures are isolated; the proxy itself only fails when upstream is
-//!   genuinely unreachable.
+//! - `bind` claims `--proxy-listen` up front (main calls it before the sudo prompt and
+//!   the TUI), so a taken port or a bad address fails at startup.
+//! - Forwards every request to `--ollama-url`. Request bodies are buffered (64 MiB cap)
+//!   so OpenAI-compatible ones can get `stream_options.include_usage` injected; response
+//!   bodies stream through to the client unbuffered.
+//! - For inference paths (`/api/chat`, `/api/generate`, `/v1/chat/completions`,
+//!   `/v1/completions`) a per-request driver task tees each response chunk into a
+//!   `parser::Accumulator`. When the body finishes, the accumulator is finalized and an
+//!   `InferenceRecord` is sent to `records_tx` (model load/unload calls excepted).
+//! - Parser failures never change the bytes the client sees. The proxy's own errors are
+//!   502 (upstream unreachable), 500 (request body unreadable or over the cap) and 405.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -38,16 +41,30 @@ struct ProxyState {
     records_tx: mpsc::Sender<InferenceRecord>,
 }
 
+/// Claims the proxy's listening socket. `main` calls this before the sudo prompt and the
+/// TUI, so a taken port or a bad `--proxy-listen` stops startup with the error instead of
+/// leaving a dashboard with no proxy behind it.
+pub fn bind(listen: &str) -> Result<std::net::TcpListener> {
+    let addr: SocketAddr = listen.parse().with_context(|| {
+        format!("invalid --proxy-listen value: {listen} (expected IP:port, e.g. 127.0.0.1:11435)")
+    })?;
+    let listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+    // tokio's TcpListener::from_std requires a non-blocking socket.
+    listener
+        .set_nonblocking(true)
+        .context("set proxy listener non-blocking")?;
+    Ok(listener)
+}
+
 pub async fn serve(
-    listen: String,
+    listener: std::net::TcpListener,
     upstream_base: String,
     session_id: i64,
     records_tx: mpsc::Sender<InferenceRecord>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let addr: SocketAddr = listen
-        .parse()
-        .with_context(|| format!("invalid --proxy-listen value: {}", listen))?;
+    let listener = TcpListener::from_std(listener).context("register proxy listener")?;
+    let addr = listener.local_addr().context("proxy listener address")?;
 
     let client = reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -65,9 +82,6 @@ pub async fn serve(
 
     let app = Router::new().fallback(any(handle)).with_state(state);
 
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind {}", addr))?;
     info!(
         listen = %addr,
         upstream = %upstream_clean,
@@ -103,8 +117,8 @@ async fn handle(State(state): State<ProxyState>, req: Request) -> Result<Respons
     debug!(method = %method, path = %uri.path(), "proxy request received");
 
     // Read the full body up-front via axum::body::to_bytes (the supported
-    // axum 0.8 + hyper 1.x path). 64 MiB cap covers chat/generate easily and
-    // bounds the worst case for /api/pull etc.
+    // axum 0.8 + hyper 1.x path). The 64 MiB cap covers chat/generate easily and
+    // bounds memory; bigger uploads (an `ollama create` blob push) get a 500.
     let body_bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
         Ok(b) => b,
         Err(err) => {
@@ -272,8 +286,9 @@ where
                     }
                 })
                 .await;
+                // Debug, not info: agent clients hang up like this on nearly every request.
                 match drained {
-                    Ok(()) if !acc.awaiting_usage_trailer() => info!(
+                    Ok(()) if !acc.awaiting_usage_trailer() => debug!(
                         path = %path,
                         "client disconnected before usage frame; drained upstream to keep real token counts"
                     ),
@@ -285,6 +300,14 @@ where
             }
 
             match acc.finalize() {
+                // Model load/unload calls (an empty prompt, or keep_alive: 0) end done: true
+                // with no tokens. They aren't inferences, and recording them would inflate
+                // request counts and drag down mean TTFT.
+                Some(stats) if stats.is_load_or_unload() => debug!(
+                    path = %path,
+                    reason = %stats.stop_reason,
+                    "model load/unload call (not recorded)"
+                ),
                 Some(stats) => {
                     let record = stats_to_record(stats, session_id);
                     debug!(
@@ -320,17 +343,19 @@ where
 
 /// For /v1/chat/completions and /v1/completions, set stream_options.include_usage = true
 /// in the JSON body so Ollama emits a final SSE chunk containing token counts.
-/// Returns the original bytes if the path doesn't match, the body isn't valid JSON,
-/// or it isn't a JSON object.
+/// Returns the original bytes if the path doesn't match, the body is empty (CORS
+/// preflights, GETs) or isn't valid JSON, or it isn't a JSON object.
 fn ensure_openai_include_usage(path: &str, body: Bytes) -> Bytes {
-    if !(path.contains("/v1/chat/completions") || path.contains("/v1/completions")) {
+    if body.is_empty()
+        || !(path.contains("/v1/chat/completions") || path.contains("/v1/completions"))
+    {
         return body;
     }
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
-            let prefix = String::from_utf8_lossy(&body[..body.len().min(120)]).into_owned();
-            warn!(%path, body_len = body.len(), %err, %prefix, "v1 request body not parseable as JSON; skipping include_usage injection");
+            // No body bytes in the log: they can carry prompt text.
+            warn!(%path, body_len = body.len(), %err, "v1 request body not parseable as JSON; skipping include_usage injection");
             return body;
         }
     };
@@ -498,6 +523,13 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skips_empty_body() {
+        // CORS preflights (OPTIONS) and GETs carry no body: nothing to rewrite or warn about.
+        let out = ensure_openai_include_usage("/v1/chat/completions", Bytes::new());
+        assert!(out.is_empty());
+    }
+
     fn sse_frame(json: &str) -> Bytes {
         Bytes::from(format!("data: {json}\n\n"))
     }
@@ -588,5 +620,85 @@ mod tests {
         assert_eq!(record.envelope, "openai-sse-approx");
         assert_eq!(record.prompt_tokens, 0);
         assert_eq!(record.gen_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn load_call_is_not_recorded() {
+        let (records_tx, mut records_rx) = mpsc::channel(4);
+        // Ollama's answer to a model load (e.g. `ollama run`'s preload): done, no tokens.
+        let line = Bytes::from_static(
+            b"{\"model\":\"qwen3:14b\",\"created_at\":\"2026-10-04T15:00:00Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done_reason\":\"load\",\"done\":true}\n",
+        );
+        let upstream = futures_util::stream::iter([Ok::<Bytes, Infallible>(line.clone())]);
+        let tee = TeeContext {
+            envelope: parser::Envelope::OllamaStream,
+            path: "/api/chat".to_string(),
+            ..tee(records_tx)
+        };
+        let body = build_response_body(upstream, Some(tee));
+        // The client still gets every byte...
+        let got = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(got, line);
+        // ...and the driver, which owned the only sender, finished without recording.
+        assert!(
+            records_rx.recv().await.is_none(),
+            "load call must not be recorded"
+        );
+    }
+
+    #[test]
+    fn bind_rejects_hostnames_and_taken_ports() {
+        let err = bind("localhost:11435").unwrap_err();
+        assert!(format!("{err:#}").contains("expected IP:port"), "{err:#}");
+
+        let first = bind("127.0.0.1:0").unwrap();
+        let taken = first.local_addr().unwrap().to_string();
+        let err = bind(&taken).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("bind {taken}")),
+            "{err:#}"
+        );
+    }
+
+    /// Real sockets end to end: client → proxy → mock upstream replaying a captured stream.
+    #[tokio::test]
+    async fn proxies_and_records_over_real_sockets() {
+        const STREAM: &str = include_str!("../fixtures/ollama-chat-stream.jsonl");
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let mock = Router::new().route(
+            "/api/chat",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+                    STREAM,
+                )
+            }),
+        );
+        tokio::spawn(async move { axum::serve(upstream, mock).await });
+
+        let listener = bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let (records_tx, mut records_rx) = mpsc::channel(4);
+        // Keep the sender alive: a dropped sender reads as a shutdown signal.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(serve(listener, upstream_url, 7, records_tx, shutdown_rx));
+
+        let body = reqwest::Client::new()
+            .post(format!("{proxy_url}/api/chat"))
+            .body(r#"{"model":"qwen3:14b","messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, STREAM, "client must see upstream's bytes unchanged");
+
+        let record = records_rx.recv().await.expect("record should be emitted");
+        assert_eq!(record.session_id, 7);
+        assert_eq!(record.model_id, "qwen3:14b");
+        assert_eq!(record.envelope, "ollama-stream");
+        assert!(record.gen_tokens > 0);
     }
 }
