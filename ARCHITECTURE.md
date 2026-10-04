@@ -169,7 +169,7 @@ The `cpu_power` sampler is included alongside `ane_power` because on M1/M4 Macs 
 
 ## TUI
 
-`ratatui` 0.30 + `crossterm` 0.29. A port of LMS-Monitor's TUI: same layout (heights fit 120×36 minimum), columns, colours and keys. Top-to-bottom:
+`ratatui` 0.30 + `crossterm` 0.29. A port of [LMS-Monitor](https://github.com/Ward-Software-Defined-Systems/LMS-Monitor)'s TUI: same layout (heights fit 120×36 minimum), columns, colours and keys. Top-to-bottom:
 
 | panel | rows | widget |
 |---|---|---|

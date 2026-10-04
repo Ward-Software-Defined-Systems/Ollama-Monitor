@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 description = "Passive observer for a local Ollama instance: live request feed, rolling tok/s, hypothetical frontier-API cost, and hardware telemetry in a TUI."
 license = "MIT"
+repository = "https://github.com/Ward-Software-Defined-Systems/Ollama-Monitor"
 
 [[bin]]
 name = "ollama-monitor"

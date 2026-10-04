@@ -143,7 +143,7 @@ cargo test live_ollama -- --ignored --nocapture   # render the models panel from
 
 CI ([`.gitlab-ci.yml`](.gitlab-ci.yml)) runs the same checks on Linux. [ARCHITECTURE.md](ARCHITECTURE.md) covers the module layout, data flow and design decisions.
 
-Ollama-Monitor shares its dashboard with LMS-Monitor, a sibling project for [LM Studio](https://lmstudio.ai).
+Ollama-Monitor shares its dashboard with [LMS-Monitor](https://github.com/Ward-Software-Defined-Systems/LMS-Monitor), a sibling project for LM Studio.
 
 ## License
 
