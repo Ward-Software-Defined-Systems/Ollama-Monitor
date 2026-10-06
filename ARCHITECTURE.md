@@ -6,7 +6,7 @@ A single Rust binary that sits in front of a local Ollama as an HTTP reverse pro
 
 ## Process model
 
-One OS process and one multi-threaded `tokio` runtime, plus a plain thread for keyboard input, the SQLite writer on tokio's blocking pool, and a `sudo powermetrics` child. Tasks talk over bounded `tokio::sync::mpsc` channels (capacities in parentheses); shutdown fans out through one `tokio::sync::watch::channel<bool>`.
+One OS process and one multi-threaded `tokio` runtime, plus a plain thread for keyboard input, the SQLite writer on tokio's blocking pool, and a GPU telemetry child (`sudo powermetrics` on macOS, `nvidia-smi` on Linux). Tasks talk over bounded `tokio::sync::mpsc` channels (capacities in parentheses); shutdown fans out through one `tokio::sync::watch::channel<bool>`.
 
 ```
 clients ──HTTP──▶ proxy (axum) ──reqwest──▶ Ollama
@@ -23,13 +23,13 @@ clients ──HTTP──▶ proxy (axum) ──reqwest──▶ Ollama
             ▲      ▲      ▲      ▲
             │      │      │      └─ lifetime_tx (4) ◀─ lifetime poller (2 s, second connection)
             │      │      └──────── key_tx (64) ◀──── input thread (crossterm)
-            │      └─────────────── hw_tx (8) ◀────── hardware::sample ◀── sudo -n powermetrics
+            │      └─────────────── hw_tx (8) ◀────── hardware::sample ◀── telemetry child (sudo -n powermetrics / nvidia-smi)
             └────────────────────── models_tx (8) ◀── api::poll_models (2 s)
 
 shutdown: watch<bool> reaches every task; q / Ctrl-C / SIGINT / SIGTERM set it
 ```
 
-`main` spawns the proxy, the signal task (SIGINT, SIGTERM, SIGHUP) and, in TUI mode, the model poller and the hardware sampler. `tui::run` spawns the lifetime poller and the input thread, `db::open_and_spawn_writer` the writer, and the proxy one driver task per tracked response. Headless mode (`--no-tui`) runs only the proxy, the writer and the signal task: no poller, no sampler (so no sudo), no lifetime poller.
+`main` spawns the proxy, the signal task (SIGINT, SIGTERM, SIGHUP) and, in TUI mode, the model poller and the hardware sampler. `tui::run` spawns the lifetime poller and the input thread, `db::open_and_spawn_writer` the writer, and the proxy one driver task per tracked response. Headless mode (`--no-tui`) runs only the proxy, the writer and the signal task: no poller, no sampler (so no telemetry child and, on macOS, no sudo), no lifetime poller.
 
 ## Modules
 
@@ -42,8 +42,10 @@ shutdown: watch<bool> reaches every task; q / Ctrl-C / SIGINT / SIGTERM set it
 | `src/aggregate.rs` | The session's records in memory; 1m / 5m / 15m / session windows; mean / p50 / p95; per-model breakdown |
 | `src/pricing.rs` | `FRONTIER_MODELS` (the cost columns); the baked-in `pricing.toml` merged with user overrides; `hypothetical_cost` |
 | `src/db.rs` | SQLite schema, the writer task behind `DbHandle`, sessions, `lifetime_totals` |
-| `src/config.rs` | App-support paths for db / config / log; the optional user TOML |
-| `src/hardware.rs` | `sysinfo` CPU / memory and Ollama process detection; `prime_sudo` and the `sudo -n powermetrics` reader for GPU / ANE |
+| `src/config.rs` | Per-platform directories for db / config / log (Application Support on macOS, XDG on Linux); the optional user TOML |
+| `src/hardware/mod.rs` | `sysinfo` CPU / memory and Ollama process detection; `prime` and the shared reader task for the telemetry child, with the platform backend chosen at compile time |
+| `src/hardware/powermetrics.rs` | macOS backend: `sudo -v`, the `sudo -n powermetrics` command and its GPU residency / ANE power parser |
+| `src/hardware/nvidia_smi.rs` | Linux backend: the `nvidia-smi` loop command and its CSV parser (GPU utilization, VRAM used, aggregated across GPUs) |
 | `src/tui/mod.rs` | `AppState`, the event loop, `render()`, the lifetime poller, the input thread, panic-safe terminal restore |
 | `src/tui/layout.rs` | Top-to-bottom panel layout, byte-identical to LMS-Monitor's |
 | `src/tui/widgets.rs` | Per-panel render functions, ported from LMS-Monitor |
@@ -64,7 +66,7 @@ Clients must point at the proxy port (or the user moves Ollama to another port a
 
 ## Proxy request path
 
-`proxy::bind` parses `--proxy-listen` as a `SocketAddr` (an IP and port, no host names) and binds a `std::net::TcpListener`. `main` calls it before the sudo prompt and before the runtime starts, so a taken port or a malformed address exits with the error instead of leaving a dashboard with nothing behind it. `serve` hands the socket to tokio and runs axum with a single fallback handler for every method and path.
+`proxy::bind` parses `--proxy-listen` as a `SocketAddr` (an IP and port, no host names) and binds a `std::net::TcpListener`. `main` calls it before the telemetry prime step (the sudo prompt on macOS) and before the runtime starts, so a taken port or a malformed address exits with the error instead of leaving a dashboard with nothing behind it. `serve` hands the socket to tokio and runs axum with a single fallback handler for every method and path.
 
 For each request the handler:
 
@@ -200,20 +202,27 @@ Changing the list means editing all of these together: `pricing.toml` (and its "
 Two sources, merged into one `HardwareSnapshot` every 2 s. The sampler runs only in TUI mode.
 
 - **CPU, memory and Ollama's processes** via `sysinfo`, no privilege needed. A process counts as Ollama's if its executable path or `argv[0]` contains one of:
-  - `/Applications/Ollama.app/` (desktop install; this also catches the app's own menu-bar process)
+  - `/Applications/Ollama.app/` (macOS desktop install; this also catches the app's own menu-bar process)
   - `/opt/homebrew/opt/ollama/`, `/opt/homebrew/Cellar/ollama/` (Apple Silicon Homebrew)
   - `/usr/local/opt/ollama/`, `/usr/local/Cellar/ollama/` (Intel Homebrew)
+  - `/usr/local/lib/ollama/`, `/usr/lib/ollama/`, `/snap/ollama/` (Linux install script, distro packages, snap; older releases kept their `ollama_llama_server` runners under the first)
   - `/.ollama/` (model store / runner workdir)
 
-  or if its executable name is exactly `ollama`. That catches the `ollama serve` parent and the `ollama runner` subprocesses, where a loaded model's memory lives. The name match is deliberately exact: a prefix match would count `ollama-monitor` itself.
+  or if its executable name is exactly `ollama`. That catches the `ollama serve` parent and the `ollama runner` subprocesses, where a loaded model's memory lives. The name match is deliberately exact: a prefix match would count `ollama-monitor` itself. The hints are directories for the same reason: a bare `/usr/local/bin/ollama` would match `/usr/local/bin/ollama-monitor`.
 
-- **GPU active residency and ANE power** via `sudo -n powermetrics --samplers cpu_power,gpu_power,ane_power -i 2000`, text-parsed for the `GPU HW active residency:` and `ANE Power:` lines. `hardware::prime_sudo()` runs `sudo -v` before the TUI enters raw mode, so the password prompt gets a normal terminal; `-n` then keeps the real launch non-interactive. The `cpu_power` sampler is included alongside `ane_power` because on M1/M4 Macs the unified power summary that holds the `ANE Power:` line only appears when `cpu_power` is requested.
+  The refresh kind asks for CPU, memory, `exe` and `cmd` (both `OnlyIfNotSet`) and is `without_tasks()`. The last part matters on Linux, where sysinfo otherwise lists every thread as a process of its own; each Ollama thread is named `ollama`, so the count, RSS and CPU would all be inflated. Also on Linux, `/proc/<pid>/exe` is unreadable for another user's processes, so `exe()` is empty for the systemd `ollama` service; the name (`/proc/<pid>/stat`) and `argv[0]` (`/proc/<pid>/cmdline`) are world-readable and do the matching.
 
-  The sudo child gets a null stdin and its own process group (`process_group(0)`). That's hardening: since sudo 1.9.14 `use_pty` is on by default, and a sudo in the terminal's foreground process group may read terminal input to relay to its command, competing with crossterm for keystrokes. Outside the foreground group and without stdin, it never reads from or reconfigures the TUI's terminal. This is safe only with `-n` (a background sudo that prompted would stop on SIGTTIN), and it must not be `setsid`, because sudo's cached credentials are tied to the terminal session.
+- **GPU telemetry** from a child process whose stdout the shared reader task in `hardware/mod.rs` parses line by line. Both backends compile on every platform and expose the same four items (`PROGRAM`, `prime`, `command`, `State`); a `cfg(target_os)` alias picks the active one, and the inactive one is `allow(dead_code)` so both parsers' tests run everywhere.
 
-  If sudo or powermetrics fails, or powermetrics exits later, the log says `powermetrics exited`, GPU / ANE fall back to `n/a`, and nothing restarts it; everything else keeps working. On shutdown the sampler sends SIGTERM to the sudo child via `libc::kill`, and sudo relays it to powermetrics, so nothing is left running as root.
+  - **macOS** (`powermetrics.rs`): `sudo -n powermetrics --samplers cpu_power,gpu_power,ane_power -i 2000`, text-parsed for the `GPU HW active residency:` and `ANE Power:` lines. `hardware::prime()` runs `sudo -v` before the TUI enters raw mode, so the password prompt gets a normal terminal; `-n` then keeps the real launch non-interactive. The `cpu_power` sampler is included alongside `ane_power` because on M1/M4 Macs the unified power summary that holds the `ANE Power:` line only appears when `cpu_power` is requested.
 
-`sysinfo` is pinned to the same 0.38 line as LMS-Monitor so both TUIs report identical memory figures. "free" is XNU's available-non-compressed memory (active + inactive + free pages); 0.32 subtracted compressor pages instead and floored at 0 under heavy compression.
+    The sudo child gets a null stdin and its own process group (`process_group(0)`). That's hardening: since sudo 1.9.14 `use_pty` is on by default, and a sudo in the terminal's foreground process group may read terminal input to relay to its command, competing with crossterm for keystrokes. Outside the foreground group and without stdin, it never reads from or reconfigures the TUI's terminal. This is safe only with `-n` (a background sudo that prompted would stop on SIGTTIN), and it must not be `setsid`, because sudo's cached credentials are tied to the terminal session.
+
+  - **Linux** (`nvidia_smi.rs`): `nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits -lms 2000`, one `index, percent, MiB` line per NVIDIA GPU per interval, no privilege, so `prime()` does nothing. The state keeps the latest reading per GPU index; the row shows the busiest GPU's utilization and the summed memory, in the panel's decimal units (16 376 MiB reads as 17.2 GB). nvidia-smi never touches the terminal, so it stays in the TUI's process group and a closing terminal's SIGHUP reaches it too. Intel and AMD GPUs have no unprivileged source here and show `n/a`. Ollama's `/api/ps` reports `size_vram` per loaded model, which would be a vendor-neutral figure for the models' VRAM; not used yet.
+
+  If the child can't be spawned or exits later, the log says `spawn … failed` or `powermetrics exited` / `nvidia-smi exited`, the GPU figures fall back to `n/a`, and nothing restarts it; everything else keeps working. On shutdown the sampler sends SIGTERM to the child via `libc::kill`; on macOS sudo relays it to powermetrics, so nothing is left running as root.
+
+`sysinfo` is pinned to the same 0.38 line as LMS-Monitor so both TUIs report identical memory figures. On macOS "free" is XNU's available-non-compressed memory (active + inactive + free pages); 0.32 subtracted compressor pages instead and floored at 0 under heavy compression. On Linux it is the kernel's `MemAvailable`.
 
 ## TUI
 
@@ -223,7 +232,7 @@ Two sources, merged into one `HardwareSnapshot` every 2 s. The sampler runs only
 |---|---|---|
 | header | 3 | `ollama-monitor · server: ● reachable/unreachable/unknown (url) · err · [PAUSED] · lifetime: reqs / sessions / prompt tok / gen tok · local clock`; Ollama-only `ollama vX · proxy ADDR` right-aligned in the top border |
 | loaded models | 6 (3 model rows) | every `/api/tags` model merged with `/api/ps`, sorted loaded → cloud → not-loaded: id · type · compat · quant · ctx · state, `▸` on the most recent inference target. Rows past the third are cut off |
-| hardware | 3 | one line: system CPU / MEM (free) │ Ollama CPU / RSS / process count │ GPU / ANE |
+| hardware | 3 | one line: system CPU / MEM (free) │ Ollama CPU / RSS / process count │ GPU / ANE (macOS) or GPU / VRAM (Linux) |
 | live feed | `Min(7)` (4 records at 36 rows) | up to 30 records, newest first: local completion time · model · prompt · gen · TTFT ms · tok/s · stop; `~` marks approximate (`openai-sse-approx`) rows |
 | rolling metrics | 9 | `1m / 5m / 15m / session` columns; rows: requests, prompt tok, gen tok, mean tok/s, p95 tok/s, mean TTFT |
 | hypothetical cost | 7 | frontier models as columns; input / output / total USD rows for the session |
@@ -249,7 +258,7 @@ Restoring always goes through `ratatui::try_restore()`, with errors only logged 
 
 ## Logging
 
-`tracing` always writes to the log file in the app-support directory (`tracing_appender::rolling::never`: appended, never rotated). In headless mode it also writes to stderr. In TUI mode nothing goes to stdout or stderr, which would corrupt the screen.
+`tracing` always writes to the log file in the app data directory (README › Files) (`tracing_appender::rolling::never`: appended, never rotated). In headless mode it also writes to stderr. In TUI mode nothing goes to stdout or stderr, which would corrupt the screen.
 
 The filter comes from `OLLAMA_MONITOR_LOG` (default `info`). `tracing-subscriber`'s default `tracing-log` feature bridges the `log` crate (reqwest uses it), and hyper-util and h2 emit tracing events of their own, so a bare `debug` or `trace` includes library noise; scope it with `ollama_monitor=debug`. Lines don't carry their target, so library lines aren't labelled as such.
 
@@ -259,12 +268,12 @@ At the default level the log holds startup and shutdown lines, warnings, and a l
 
 Startup, in order:
 
-1. Parse the CLI; resolve paths (creating `~/Library/Application Support/ollama-monitor/`).
+1. Parse the CLI; resolve paths (creating the data directory: `~/Library/Application Support/ollama-monitor/` on macOS, `~/.local/share/ollama-monitor/` on Linux).
 2. Start logging, then load the config and pricing, so their warnings are logged.
 3. `proxy::bind`: a taken port or a bad address exits here, before any prompt.
-4. In TUI mode, `prime_sudo` (the password prompt).
+4. In TUI mode, `hardware::prime` (the sudo password prompt on macOS; nothing on Linux).
 5. Build the runtime; open the database and insert the session row.
-6. Spawn the proxy and the signal task, plus, in TUI mode, the poller and the hardware sampler (which starts powermetrics).
+6. Spawn the proxy and the signal task, plus, in TUI mode, the poller and the hardware sampler (which starts the telemetry child).
 7. Run the TUI or the headless loop.
 
 Shutdown starts with `q`, `Ctrl-C` (a key press in the TUI), SIGINT, SIGTERM or SIGHUP (the terminal window closing), all of which set the `watch` flag:
@@ -274,21 +283,21 @@ Shutdown starts with `q`, `Ctrl-C` (a key press in the TUI), SIGINT, SIGTERM or 
 3. `end_session` writes `ended_at`.
 4. `runtime.shutdown_background()` drops whatever is left, and the log is flushed.
 
-A record that completes after the UI loop exits is dropped (nothing reads `records_rx` any more), and streams still open after the 3 s grace are cut. The sudo child sits in its own process group, so a closing terminal doesn't signal it directly; the sampler's SIGTERM in step 2 stops it.
+A record that completes after the UI loop exits is dropped (nothing reads `records_rx` any more), and streams still open after the 3 s grace are cut. On macOS the sudo child sits in its own process group, so a closing terminal doesn't signal it directly; the sampler's SIGTERM in step 2 stops it. On Linux nvidia-smi shares the terminal's process group and gets the SIGHUP as well.
 
 ## Testing and CI
 
-All tests run without Ollama, sudo or a terminal:
+All tests run without Ollama, sudo, a GPU or a terminal:
 
 - **Parser**: fixture-driven (`fixtures/`, captured from real Ollama responses), with bodies fed in 64-byte chunks to exercise frame reassembly.
 - **API**: `/api/tags` and `/api/ps` parsing, `merge_models` ordering and states, name canonicalisation.
 - **Proxy**: the request rewrite and its 64 MiB cap; the driver task's behaviour (trailer drain after `finish_reason`, no drain mid-generation, load calls not recorded) on tokio's paused clock; `bind` errors; and end-to-end tests over real sockets (client → `serve` → mock upstream): one checks a response arrives unchanged with exactly one record emitted, another streams an upload just over the buffering cap through intact.
 - **TUI**: renders into ratatui's `TestBackend`. `hardware_row_survives_at_minimum_height` guards the 120×36 minimum, and `screen_snapshot` prints 120×36 and 160×44 screens for eyeballing.
-- **DB, pricing, aggregator, hardware formatting**: unit tests. The DB helper names temp files with a counter, not the clock, so parallel tests can't collide.
+- **DB, pricing, aggregator, config directories, hardware formatting and both telemetry parsers**: unit tests. The two telemetry backends compile on every platform, so the powermetrics and nvidia-smi parsers are both tested in Linux CI and on a Mac. The DB helper names temp files with a counter, not the clock, so parallel tests can't collide.
 
 Two tests are `#[ignore]`d because they touch the real machine: `live_ollama_snapshot` (read-only GETs to `127.0.0.1:11434`) and `live_sysinfo_snapshot`.
 
-GitLab CI (`.gitlab-ci.yml`, shared with LMS-Monitor) runs `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked` on a `rust:1.97` Linux image. Only runtime pieces (powermetrics, process discovery, app-support paths) are platform-specific, so the whole suite runs on Linux.
+GitLab CI (`.gitlab-ci.yml`, shared with LMS-Monitor) runs `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked` on a `rust:1.97` Linux image. Linux is a runtime target as well as the CI platform. The only code CI can't exercise is the macOS side of `config::default_dirs` and of the `telemetry` alias, so a change there wants a build on a Mac.
 
 ## Notable invariants
 
@@ -297,9 +306,9 @@ GitLab CI (`.gitlab-ci.yml`, shared with LMS-Monitor) runs `cargo fmt --all --ch
 - The proxy is the only capture path. Direct hits on Ollama's port are invisible by design.
 - Nothing writes to stdout or stderr while the TUI is up.
 - A client abort mid-generation must drop the upstream stream (that's how cancellation reaches Ollama); only a finished stream waiting on its usage frame gets drained.
-- TUI parity with LMS-Monitor: `tui/layout.rs` is byte-identical, and `tui/widgets.rs` differs only in data-model mapping plus the Ollama extras (version / proxy border title, `cloud` state, `~` markers). The `pricing.toml` values match too. Change both apps together.
+- TUI parity with LMS-Monitor: `tui/layout.rs` is byte-identical, and `tui/widgets.rs` differs only in data-model mapping plus the Ollama extras (version / proxy border title, `cloud` state, `~` markers) and the hardware row's Linux `vram` slot, a `cfg!` branch that leaves the macOS rendering unchanged. The `pricing.toml` values match too. Change both apps together.
 - Pricing keys are TOML-friendly (hyphenated, no dots): `gemini-3-1-pro`, not `gemini-3.1-pro`.
-- Besides the startup `sudo -v`, `sudo -n powermetrics` is the only subprocess. It runs with no stdin, in its own process group.
+- The telemetry child is the only subprocess: on macOS `sudo -n powermetrics` (plus the startup `sudo -v`), with no stdin and its own process group; on Linux `nvidia-smi`, unprivileged, with no stdin.
 
 ## Reference files
 

@@ -399,7 +399,8 @@ mod tests {
             ollama_process_count: 2,
             ollama_cpu_percent: 12.3,
             ollama_rss_bytes: 103_000_000,
-            gpu_active_residency_pct: Some(38.5),
+            gpu_util_pct: Some(38.5),
+            gpu_mem_used_bytes: Some(5_100_000_000),
             ane_power_mw: Some(234.0),
         };
         state
@@ -469,8 +470,13 @@ mod tests {
             );
         }
         let hw_row = line_with(&lines, "ollama cpu");
+        let telemetry_tail = if cfg!(target_os = "macos") {
+            "ane  234 mW"
+        } else {
+            "vram 5.1 GB"
+        };
         assert!(
-            hw_row.contains("ane  234 mW"),
+            hw_row.contains(telemetry_tail),
             "hardware row clipped: {hw_row}"
         );
         assert!(lines.last().unwrap().contains("q quit"), "footer missing");
