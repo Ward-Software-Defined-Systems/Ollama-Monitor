@@ -380,9 +380,10 @@ pub fn render_costs(f: &mut Frame, area: Rect, snap: &AggregateSnapshot, pricing
     f.render_widget(table, area);
 }
 
-/// One-line hardware summary: system cpu/mem │ Ollama process tree │ GPU/ANE.
-/// Groups run from most to least important left→right, so a narrow terminal
-/// clips the GPU/ANE tail before anything else.
+/// One-line hardware summary: system cpu/mem │ Ollama processes │ GPU telemetry, where
+/// the tail is `gpu … ane …` on macOS and `gpu … vram …` elsewhere (the Linux backend
+/// has no ANE figure). Groups run from most to least important left→right, so a narrow
+/// terminal clips the GPU tail before anything else.
 fn hardware_line(hw: &HardwareSnapshot) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let sep = || Span::styled(" │ ", dim);
@@ -436,22 +437,31 @@ fn hardware_line(hw: &HardwareSnapshot) -> Line<'static> {
 
     spans.push(sep());
     spans.push(Span::raw("gpu "));
-    spans.push(match hw.gpu_active_residency_pct {
+    spans.push(match hw.gpu_util_pct {
         Some(pct) => Span::styled(format!("{pct:>5.1}%"), cpu_style(pct)),
         None => Span::styled("  n/a", dim),
     });
-    spans.push(Span::raw("  ane "));
-    spans.push(match hw.ane_power_mw {
-        Some(mw) => Span::styled(
-            format!("{mw:>4.0} mW"),
-            Style::default().fg(if mw > 100.0 {
-                Color::Yellow
-            } else {
-                Color::Green
-            }),
-        ),
-        None => Span::styled(" n/a", dim),
-    });
+    // `cfg!` rather than `#[cfg]` so both arms type-check on every platform.
+    if cfg!(target_os = "macos") {
+        spans.push(Span::raw("  ane "));
+        spans.push(match hw.ane_power_mw {
+            Some(mw) => Span::styled(
+                format!("{mw:>4.0} mW"),
+                Style::default().fg(if mw > 100.0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            ),
+            None => Span::styled(" n/a", dim),
+        });
+    } else {
+        spans.push(Span::raw("  vram "));
+        spans.push(match hw.gpu_mem_used_bytes {
+            Some(bytes) => Span::styled(format_bytes(bytes), Style::default().fg(Color::Cyan)),
+            None => Span::styled(" n/a", dim),
+        });
+    }
 
     Line::from(spans)
 }
@@ -515,8 +525,12 @@ mod tests {
     }
 
     /// Worst-case-ish values: three-digit percentages, three-digit GB, double-digit
-    /// proc count, four-digit ANE mW. The whole row must stay one line and fit the
-    /// 118 inner columns of a 120-column terminal (typical values land near 110).
+    /// proc count, four-digit ANE mW / two-digit GB of VRAM. The whole row must stay one
+    /// line and fit the 118 inner columns of a 120-column terminal (typical values land
+    /// near 110). Arithmetic: 92 columns through the second separator, 10 for
+    /// `gpu 100.0%`, then 13 for `  ane 1234 mW` (115) or 14 for `  vram 15.9 GB` (116).
+    /// A ≥100 GB VRAM sum or a 32-core `ollama cpu 3200.0%` adds one column each, still
+    /// within 118.
     #[test]
     fn hardware_line_is_one_compact_row() {
         let hw = HardwareSnapshot {
@@ -527,7 +541,8 @@ mod tests {
             ollama_process_count: 12,
             ollama_cpu_percent: 850.3,
             ollama_rss_bytes: 98_700_000_000,
-            gpu_active_residency_pct: Some(100.0),
+            gpu_util_pct: Some(100.0),
+            gpu_mem_used_bytes: Some(15_900_000_000),
             ane_power_mw: Some(1234.0),
         };
         let line = hardware_line(&hw);
@@ -546,7 +561,11 @@ mod tests {
             "rss 98.7 GB",
             "12 procs",
             "gpu 100.0%",
-            "ane 1234 mW",
+            if cfg!(target_os = "macos") {
+                "ane 1234 mW"
+            } else {
+                "vram 15.9 GB"
+            },
         ] {
             assert!(text.contains(needle), "missing {needle:?} in {text:?}");
         }
@@ -563,7 +582,12 @@ mod tests {
             "rss should be omitted without a process: {text:?}"
         );
         assert!(text.contains("gpu   n/a"), "{text:?}");
-        assert!(text.contains("ane  n/a"), "{text:?}");
+        let telemetry_na = if cfg!(target_os = "macos") {
+            "ane  n/a"
+        } else {
+            "vram  n/a"
+        };
+        assert!(text.contains(telemetry_na), "{text:?}");
     }
 
     #[test]

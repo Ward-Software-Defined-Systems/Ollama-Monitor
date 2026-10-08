@@ -1,6 +1,6 @@
 # Ollama-Monitor
 
-A terminal dashboard for [Ollama](https://ollama.com) on macOS. It sits in front of your local Ollama as a transparent proxy and shows each chat and completion request's tokens, time to first token and throughput, what the same tokens would have cost on frontier APIs, and live Apple Silicon hardware telemetry.
+A terminal dashboard for [Ollama](https://ollama.com) on macOS and Linux. It sits in front of your local Ollama as a transparent proxy and shows each chat and completion request's tokens, time to first token and throughput, what the same tokens would have cost on frontier APIs, and live hardware telemetry (Apple Silicon GPU and Neural Engine on macOS, NVIDIA GPU on Linux).
 
 ![Ollama-Monitor running in a terminal](assets/Ollama-Monitor.png)
 
@@ -10,7 +10,7 @@ A terminal dashboard for [Ollama](https://ollama.com) on macOS. It sits in front
 - **Models**: every installed model, local and `:cloud`, with its type, format, quantization, context length and state, sorted loaded, then cloud, then not-loaded. The panel has room for three rows, so on a machine with many models the loaded ones come first. `▸` marks the model the last request went to.
 - **Rolling metrics**: requests, tokens, mean and p95 tokens per second, and mean time to first token over the last 1, 5 and 15 minutes and the whole session.
 - **Hypothetical cost**: your session's token counts priced at list rates for Claude Fable 5.1, Fable 5, Opus 5.5, Opus 5, Opus 4.8 and Gemini 3.1 Pro.
-- **Hardware**: system CPU and memory, CPU and memory of Ollama's processes (the app, the server and its model runners), GPU active residency and Neural Engine power.
+- **Hardware**: system CPU and memory, CPU and memory of Ollama's processes (the app, the server and its model runners), and GPU telemetry: GPU active residency and Neural Engine power on macOS, GPU utilization and VRAM in use on Linux with an NVIDIA GPU.
 - **History**: lifetime request and token totals across sessions, kept in a local SQLite database.
 
 ## How it works
@@ -26,7 +26,7 @@ client ──▶ :11435 ollama-monitor ──▶ :11434 ollama
 
 Point your clients at the proxy's port instead of Ollama's. Responses pass through unchanged. So do requests, with one exception: for OpenAI-compatible requests that don't set `stream: false`, the proxy adds `stream_options.include_usage: true` so that Ollama reports token counts. Clients ignore the extra final chunk this produces. Requests sent straight to Ollama's own port aren't seen.
 
-It also polls Ollama's `/api/version`, `/api/tags` and `/api/ps` every 2 seconds for the model list. Hardware figures come from [`sysinfo`](https://crates.io/crates/sysinfo) and from macOS's `powermetrics`, which needs sudo.
+It also polls Ollama's `/api/version`, `/api/tags` and `/api/ps` every 2 seconds for the model list. Hardware figures come from [`sysinfo`](https://crates.io/crates/sysinfo) and, for the GPU, from macOS's `powermetrics` (which needs sudo) or Linux's `nvidia-smi` (which doesn't).
 
 **Privacy:** the database stores only per-request metadata (model, token counts, timings), never prompt or response text, and the monitor's log doesn't contain them either. The monitor talks only to the Ollama server you point it at; the cost figures come from a pricing table compiled into the binary.
 
@@ -34,10 +34,11 @@ It also polls Ollama's `/api/version`, `/api/tags` and `/api/ps` every 2 seconds
 
 ## Requirements
 
-- macOS. Apple Silicon is recommended: the GPU and Neural Engine figures come from `powermetrics`.
-- Ollama running (the desktop app or `ollama serve`), by default on port 11434.
+- macOS or Linux (developed on Ubuntu x86_64).
+  - macOS: Apple Silicon is recommended, and sudo is needed for the GPU and Neural Engine figures, which come from `powermetrics`.
+  - Linux: the GPU figures come from `nvidia-smi`, so they need the NVIDIA driver; with other GPUs they show `n/a`. Building needs a C compiler (`sudo apt install build-essential` on Ubuntu) for the bundled SQLite.
+- Ollama running (the desktop app, `ollama serve` or the Linux systemd service), by default on port 11434.
 - Rust 1.94 or newer, to build.
-- sudo, for the GPU and Neural Engine figures only.
 
 ## Install
 
@@ -60,7 +61,7 @@ Then point your clients at `http://127.0.0.1:11435` instead of Ollama's `:11434`
 curl http://localhost:11435/api/chat -d '{"model": "qwen3:14b", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
-At launch it asks for your sudo password, used only to start `powermetrics` for the GPU and Neural Engine figures. Run it as your normal user, not under `sudo`, so the proxy never runs as root. If sudo fails, those two figures show `n/a` and everything else still works. If the proxy's address is taken or malformed, it exits straight away with the error, before asking for the password.
+On macOS it asks for your sudo password at launch, used only to start `powermetrics` for the GPU and Neural Engine figures. Run it as your normal user, not under `sudo`, so the proxy never runs as root. If sudo fails, those two figures show `n/a` and everything else still works. If the proxy's address is taken or malformed, it exits straight away with the error, before asking for the password. On Linux there is no prompt: `nvidia-smi` runs unprivileged, and without it the GPU figures show `n/a`.
 
 `--no-tui` runs headless instead: one summary line per request on stderr (alongside the log's info lines), still recorded to the database. Headless mode never prompts for sudo and skips the hardware and model polling.
 
@@ -73,6 +74,8 @@ OLLAMA_HOST=127.0.0.1:11400 ollama serve
 ollama-monitor --proxy-listen 127.0.0.1:11434 --ollama-url http://127.0.0.1:11400
 ```
 
+On Linux, where Ollama usually runs as a systemd service, move it with `sudo systemctl edit ollama`, adding `[Service]` and `Environment="OLLAMA_HOST=127.0.0.1:11400"`, then `sudo systemctl restart ollama`.
+
 Everything that talks to `:11434` then goes through the proxy, the `ollama` CLI included. Uploads such as `ollama create` from a local model file stream straight through to Ollama.
 
 ### Flags
@@ -81,8 +84,8 @@ Everything that talks to `:11434` then goes through the proxy, the `ollama` CLI 
 |---|---|---|
 | `--proxy-listen <ADDR>` | `127.0.0.1:11435` | where the proxy listens: an IP and port (`[::1]:11435` for IPv6), not a host name |
 | `--ollama-url <URL>` | `http://127.0.0.1:11434` (env `OLLAMA_URL`) | upstream Ollama; Ollama's own `OLLAMA_HOST` isn't read |
-| `--config <PATH>` | `~/Library/Application Support/ollama-monitor/config.toml` | optional config file |
-| `--db <PATH>` | `~/Library/Application Support/ollama-monitor/usage.db` | SQLite database |
+| `--config <PATH>` | `config.toml` in the config directory (see [Files](#files)) | optional config file |
+| `--db <PATH>` | `usage.db` in the data directory (see [Files](#files)) | SQLite database |
 | `--no-tui` | off | headless mode |
 
 ### Keys
@@ -106,7 +109,7 @@ Not recorded: Ollama-native streams that end before their final stats line (when
 
 ## Configuration
 
-Prices live in [`pricing.toml`](pricing.toml) and are compiled in. To change one, add an override to `~/Library/Application Support/ollama-monitor/config.toml`. For example, to price Gemini at its rate for prompts over 200K tokens:
+Prices live in [`pricing.toml`](pricing.toml) and are compiled in. To change one, add an override to the config file: `~/Library/Application Support/ollama-monitor/config.toml` on macOS, `~/.config/ollama-monitor/config.toml` on Linux (create the directory if needed). For example, to price Gemini at its rate for prompts over 200K tokens:
 
 ```toml
 [pricing.providers.google.models.gemini-3-1-pro]
@@ -120,15 +123,17 @@ The cost panel is a rough comparison, not a quote. It applies list prices to you
 
 ## Files
 
-| file | location |
-|---|---|
-| database | `~/Library/Application Support/ollama-monitor/usage.db` |
-| log | `~/Library/Application Support/ollama-monitor/ollama-monitor.log` |
-| config (optional) | `~/Library/Application Support/ollama-monitor/config.toml` |
+| file | macOS | Linux |
+|---|---|---|
+| database | `~/Library/Application Support/ollama-monitor/usage.db` | `~/.local/share/ollama-monitor/usage.db` |
+| log | `~/Library/Application Support/ollama-monitor/ollama-monitor.log` | `~/.local/share/ollama-monitor/ollama-monitor.log` |
+| config (optional) | `~/Library/Application Support/ollama-monitor/config.toml` | `~/.config/ollama-monitor/config.toml` |
 
-The log stays there whatever `--db` and `--config` say. It's appended to and never rotated, so clear it out now and then while the monitor isn't running. Set `OLLAMA_MONITOR_LOG=ollama_monitor=debug` (or `=trace`) for more detail from the monitor itself; `trace` includes the raw `powermetrics` output. A bare `debug` or `trace` also turns on the HTTP libraries' logging, which is noisy.
+On Linux the two directories follow `XDG_DATA_HOME` and `XDG_CONFIG_HOME` when those are set to absolute paths.
 
-The database is plain SQLite; [ARCHITECTURE.md](ARCHITECTURE.md#persistence) describes the schema. For example, lifetime totals per model:
+The log stays in the data directory whatever `--db` and `--config` say. It's appended to and never rotated, so clear it out now and then while the monitor isn't running. Set `OLLAMA_MONITOR_LOG=ollama_monitor=debug` (or `=trace`) for more detail from the monitor itself; `trace` includes the raw `powermetrics` or `nvidia-smi` output. A bare `debug` or `trace` also turns on the HTTP libraries' logging, which is noisy.
+
+The database is plain SQLite; [ARCHITECTURE.md](ARCHITECTURE.md#persistence) describes the schema. For example, lifetime totals per model (on Ubuntu, `sudo apt install sqlite3` first and use the Linux path):
 
 ```sh
 sqlite3 ~/Library/Application\ Support/ollama-monitor/usage.db \
@@ -143,9 +148,9 @@ sqlite3 ~/Library/Application\ Support/ollama-monitor/usage.db \
 | exits with `invalid --proxy-listen value` | Give an IP and port such as `127.0.0.1:11435`; host names like `localhost` aren't accepted. |
 | header shows `server: ● unreachable` | Is Ollama running (`curl http://localhost:11434/api/version`)? The `err:` text after the status names the call that failed. |
 | no requests appear | Clients are probably still talking to `:11434`; `curl http://localhost:11435/api/version` should answer through the proxy. Also check the header for `[PAUSED]`, and that the client uses an endpoint that's [recorded](#capture-accuracy). |
-| "Permission denied" on the log or database at startup | An earlier run under `sudo` left root-owned files: `sudo chown -R "$USER":staff ~/Library/Application\ Support/ollama-monitor`. |
-| GPU or ANE shows `n/a` | Expected for the first couple of seconds. After that, the log says `powermetrics exited` if sudo wasn't available or powermetrics failed; run with `OLLAMA_MONITOR_LOG=ollama_monitor=trace` to see its raw output. |
-| sudo prompt fails | Run `sudo -v` first, or use `--no-tui`. |
+| "Permission denied" on the log or database at startup | An earlier run under `sudo` left root-owned files. macOS: `sudo chown -R "$USER":staff ~/Library/Application\ Support/ollama-monitor`; Linux: `sudo chown -R "$USER": ~/.local/share/ollama-monitor`. |
+| GPU, ANE or VRAM shows `n/a` | Expected for the first couple of seconds. After that, the log says `powermetrics exited` (macOS) if sudo wasn't available or powermetrics failed, or `spawn nvidia-smi failed` / `nvidia-smi exited` (Linux) if the NVIDIA driver isn't installed. Intel and AMD GPUs aren't read, so layers Ollama places on them (Vulkan, ROCm) don't show in the VRAM figure. Run with `OLLAMA_MONITOR_LOG=ollama_monitor=trace` to see the raw output. |
+| sudo prompt fails (macOS) | Run `sudo -v` first, or use `--no-tui`. |
 
 ## Development
 
@@ -157,7 +162,7 @@ cargo test live_ollama -- --ignored --nocapture   # render the dashboard with yo
 cargo test live_sysinfo -- --ignored --nocapture  # print one real CPU, memory and process sample (no sudo)
 ```
 
-GitLab CI ([`.gitlab-ci.yml`](.gitlab-ci.yml)) runs the same checks on Linux. [ARCHITECTURE.md](ARCHITECTURE.md) covers the module layout, data flow and design decisions.
+GitLab CI ([`.gitlab-ci.yml`](.gitlab-ci.yml)) runs the same checks on Linux; both GPU backends compile and test on every platform. [ARCHITECTURE.md](ARCHITECTURE.md) covers the module layout, data flow and design decisions.
 
 Ollama-Monitor shares its dashboard with [LMS-Monitor](https://github.com/Ward-Software-Defined-Systems/LMS-Monitor), a sibling project for LM Studio.
 

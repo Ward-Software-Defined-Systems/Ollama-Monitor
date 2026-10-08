@@ -1,7 +1,8 @@
 //! HTTP reverse proxy in front of Ollama.
 //!
-//! - `bind` claims `--proxy-listen` up front (main calls it before the sudo prompt and
-//!   the TUI), so a taken port or a bad address fails at startup.
+//! - `bind` claims `--proxy-listen` up front (main calls it before the telemetry prime
+//!   step, the sudo prompt on macOS, and the TUI), so a taken port or a bad address fails
+//!   at startup.
 //! - Forwards every request to `--ollama-url`. OpenAI-compatible request bodies are
 //!   buffered (64 MiB cap, 413 past it) so they can get `stream_options.include_usage`
 //!   injected; all other request bodies, and every response body, stream through
@@ -43,9 +44,9 @@ struct ProxyState {
     records_tx: mpsc::Sender<InferenceRecord>,
 }
 
-/// Claims the proxy's listening socket. `main` calls this before the sudo prompt and the
-/// TUI, so a taken port or a bad `--proxy-listen` stops startup with the error instead of
-/// leaving a dashboard with no proxy behind it.
+/// Claims the proxy's listening socket. `main` calls this before the telemetry prime step
+/// (the sudo prompt on macOS) and the TUI, so a taken port or a bad `--proxy-listen` stops
+/// startup with the error instead of leaving a dashboard with no proxy behind it.
 pub fn bind(listen: &str) -> Result<std::net::TcpListener> {
     let addr: SocketAddr = listen.parse().with_context(|| {
         format!("invalid --proxy-listen value: {listen} (expected IP:port, e.g. 127.0.0.1:11435)")

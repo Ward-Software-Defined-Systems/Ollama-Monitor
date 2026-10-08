@@ -1,8 +1,10 @@
 # Format, lint and test on a Linux Docker runner.
 #
-# The app targets macOS, but only runtime pieces (powermetrics, process
-# discovery, app-support paths) are platform-specific, so the full test suite
-# runs on Linux. Pipeline secret detection is configured at the GitLab level;
+# The app targets macOS and Linux. Only the GPU telemetry child (powermetrics /
+# nvidia-smi), the Ollama process hints and the app directories are
+# platform-specific, and both telemetry backends compile everywhere, so the
+# full test suite runs on Linux. Pipeline secret detection is configured at the
+# GitLab level;
 # its jobs run in the `test` stage.
 
 workflow:

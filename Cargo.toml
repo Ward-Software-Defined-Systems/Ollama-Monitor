@@ -3,7 +3,7 @@ name = "ollama-monitor"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Terminal dashboard for a local Ollama: a transparent proxy that records each request's tokens, TTFT and throughput, prices them at frontier-API rates, and shows Apple Silicon hardware telemetry."
+description = "Terminal dashboard for a local Ollama: a transparent proxy that records each request's tokens, TTFT and throughput, prices them at frontier-API rates, and shows hardware telemetry (Apple Silicon GPU/ANE on macOS, NVIDIA GPU on Linux)."
 license = "MIT"
 repository = "https://github.com/Ward-Software-Defined-Systems/Ollama-Monitor"
 

@@ -34,11 +34,11 @@ pub struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:11434", env = "OLLAMA_URL")]
     pub ollama_url: String,
 
-    /// Optional user config TOML. Defaults to the macOS app-support dir.
+    /// Optional user config TOML. Default: config.toml under ~/Library/Application Support/ollama-monitor (macOS) or $XDG_CONFIG_HOME/ollama-monitor (Linux; ~/.config).
     #[arg(long)]
     pub config: Option<PathBuf>,
 
-    /// SQLite usage DB. Defaults to the macOS app-support dir.
+    /// SQLite usage DB. Default: usage.db under ~/Library/Application Support/ollama-monitor (macOS) or $XDG_DATA_HOME/ollama-monitor (Linux; ~/.local/share).
     #[arg(long)]
     pub db: Option<PathBuf>,
 
@@ -63,14 +63,16 @@ fn main() -> Result<()> {
     let user_config = config::load_user_config(&paths.config_file)?;
     let pricing = pricing::load(user_config.as_ref());
 
-    // Claim the proxy port before the sudo prompt and the TUI: a taken port or a bad
-    // address should stop us here, not leave a dashboard with nothing behind it.
+    // Claim the proxy port before the telemetry prime step (the sudo prompt on macOS) and
+    // the TUI: a taken port or a bad address should stop us here, not leave a dashboard
+    // with nothing behind it.
     let listener = proxy::bind(&cli.proxy_listen)
         .inspect_err(|err| tracing::error!("proxy could not start: {err:#}"))?;
 
     if !cli.no_tui {
-        // Take the sudo prompt BEFORE entering raw mode; it needs a cooked terminal.
-        hardware::prime_sudo();
+        // Prime the telemetry backend BEFORE entering raw mode: on macOS that's the sudo
+        // prompt, which needs a cooked terminal. A no-op on Linux.
+        hardware::prime();
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -134,7 +136,7 @@ async fn async_main(
     // row still gets its ended_at.
     let ui_result = if cli.no_tui {
         // Headless has no models or hardware panels, so the poller and the sampler (with
-        // its sudo powermetrics) never start.
+        // its telemetry child) never start.
         run_headless(records_rx, db_handle.clone(), shutdown_rx.clone()).await
     } else {
         let (models_tx, models_rx) = mpsc::channel::<ModelsSnapshot>(8);
