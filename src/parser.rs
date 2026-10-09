@@ -60,6 +60,23 @@ impl ParsedStats {
     }
 }
 
+/// The OpenAI-compatible chat and completion paths.
+pub fn is_openai_path(path: &str) -> bool {
+    path.contains("/v1/chat/completions") || path.contains("/v1/completions")
+}
+
+/// Ollama's native inference paths. Embeddings (/api/embed) carry no generation stats, so
+/// they pass through untracked.
+fn is_native_path(path: &str) -> bool {
+    path.contains("/api/chat") || path.contains("/api/generate")
+}
+
+/// The paths the proxy tracks: a 2xx response is parsed for stats, a 4xx or 5xx becomes a
+/// failed request.
+pub fn is_inference_path(path: &str) -> bool {
+    is_openai_path(path) || is_native_path(path)
+}
+
 /// Pick the envelope from the request URL path and the response Content-Type header.
 pub fn classify(path: &str, content_type: Option<&str>) -> Option<Envelope> {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
@@ -67,9 +84,8 @@ pub fn classify(path: &str, content_type: Option<&str>) -> Option<Envelope> {
     let is_ndjson = ct.contains("application/x-ndjson") || ct.contains("application/jsonl");
     let is_json = ct.contains("application/json");
 
-    let openai_path = path.contains("/v1/chat/completions") || path.contains("/v1/completions");
-    // Embeddings (/api/embed) carry no generation stats, so they pass through untracked.
-    let ollama_inference = path.contains("/api/chat") || path.contains("/api/generate");
+    let openai_path = is_openai_path(path);
+    let ollama_inference = is_native_path(path);
 
     if openai_path {
         return Some(if is_sse {
@@ -499,6 +515,31 @@ mod tests {
         assert_eq!(classify("/api/tags", Some("application/json")), None);
         assert_eq!(classify("/api/embed", Some("application/json")), None);
         assert_eq!(classify("/api/embeddings", Some("application/json")), None);
+    }
+
+    #[test]
+    fn inference_paths_are_the_classified_ones() {
+        for path in [
+            "/api/chat",
+            "/api/generate",
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/api/tags",
+            "/api/ps",
+            "/api/embed",
+            "/api/embeddings",
+            "/v1/embeddings",
+            "/v1/models",
+            "/api/blobs/sha256:abc",
+        ] {
+            assert_eq!(
+                is_inference_path(path),
+                classify(path, None).is_some(),
+                "{path}"
+            );
+        }
+        assert!(is_inference_path("/v1/chat/completions"));
+        assert!(!is_inference_path("/api/embed"));
     }
 
     #[test]

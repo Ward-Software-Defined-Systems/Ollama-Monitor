@@ -11,6 +11,9 @@
 //!   `/v1/completions`) a per-request driver task tees each response chunk into a
 //!   `parser::Accumulator`. When the body finishes, the accumulator is finalized and an
 //!   `InferenceRecord` is sent to `records_tx` (model load/unload calls excepted).
+//! - An inference-path request that gets a 4xx or 5xx, from Ollama or from the proxy
+//!   itself, becomes a `FailedRequest` on `failures_tx`: status, path and, when the proxy
+//!   buffered the body, the model. The error body is never read.
 //! - Parser failures never change the bytes the client sees. The proxy's own errors are
 //!   502 (upstream unreachable), 413 (buffered body over the cap), 400 (request body
 //!   unreadable), 500 (response couldn't be built) and 405.
@@ -24,7 +27,7 @@ use axum::Router;
 use axum::body::{Body, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use bytes::Bytes;
 use chrono::Utc;
@@ -33,7 +36,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-use crate::db::InferenceRecord;
+use crate::db::{FailedRequest, FailureSource, InferenceRecord};
 use crate::parser::{self, Accumulator, ParsedStats};
 
 #[derive(Clone)]
@@ -42,6 +45,7 @@ struct ProxyState {
     client: reqwest::Client,
     session_id: i64,
     records_tx: mpsc::Sender<InferenceRecord>,
+    failures_tx: mpsc::Sender<FailedRequest>,
 }
 
 /// Claims the proxy's listening socket. `main` calls this before the telemetry prime step
@@ -64,6 +68,7 @@ pub async fn serve(
     upstream_base: String,
     session_id: i64,
     records_tx: mpsc::Sender<InferenceRecord>,
+    failures_tx: mpsc::Sender<FailedRequest>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = TcpListener::from_std(listener).context("register proxy listener")?;
@@ -81,6 +86,7 @@ pub async fn serve(
         client,
         session_id,
         records_tx,
+        failures_tx,
     };
 
     let app = Router::new().fallback(any(handle)).with_state(state);
@@ -105,7 +111,64 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle(State(state): State<ProxyState>, req: Request) -> Result<Response, ProxyError> {
+/// Forwards the request, then reports it if it's on an inference path and the client gets a
+/// 4xx or 5xx, whether Ollama or the proxy itself produced it.
+async fn handle(State(state): State<ProxyState>, req: Request) -> Response {
+    let tracked = parser::is_inference_path(req.uri().path()).then(|| req.uri().path().to_owned());
+    // `forward` fills this in from a buffered (OpenAI-compatible) body; native bodies stream
+    // through unread.
+    let mut model = None;
+    let (response, source) = match forward(&state, req, &mut model).await {
+        Ok(response) => (response, FailureSource::Ollama),
+        Err(err) => (err.into_response(), FailureSource::Proxy),
+    };
+    let status = response.status();
+    // Not a 3xx: gin answers `/api/chat/` with a redirect to `/api/chat`.
+    if let Some(path) = tracked
+        && (status.is_client_error() || status.is_server_error())
+    {
+        report_failure(&state, path, status.as_u16(), source, model);
+    }
+    response
+}
+
+/// Synchronous on purpose: nothing is awaited between learning the status and returning
+/// the response, so reporting can't delay the client. A full or closed channel drops the
+/// report. Logs metadata only, never the error body.
+fn report_failure(
+    state: &ProxyState,
+    path: String,
+    status: u16,
+    source: FailureSource,
+    model_id: Option<String>,
+) {
+    info!(
+        %path,
+        status,
+        model = model_id.as_deref().unwrap_or("?"),
+        source = source.as_str(),
+        "inference request failed"
+    );
+    let failure = FailedRequest {
+        session_id: state.session_id,
+        failed_at: Utc::now(),
+        model_id,
+        path,
+        status,
+        source,
+    };
+    if let Err(err) = state.failures_tx.try_send(failure) {
+        warn!(error = %err, "failures channel unavailable; dropping failed request");
+    }
+}
+
+/// Sends one request to Ollama and builds the client's response from Ollama's. Sets `model`
+/// to the request's model once a buffered body has been read.
+async fn forward(
+    state: &ProxyState,
+    req: Request,
+    model: &mut Option<String>,
+) -> Result<Response, ProxyError> {
     let request_start = std::time::Instant::now();
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -131,7 +194,9 @@ async fn handle(State(state): State<ProxyState>, req: Request) -> Result<Respons
         // raw OpenAI SDK, ...). Injecting it is silent to clients (the extra
         // chunk has choices: []) and turns capture rate from ~0% to ~100%.
         let bytes = read_capped(body, MAX_BUFFERED_BODY).await?;
-        reqwest::Body::from(ensure_openai_include_usage(uri.path(), bytes))
+        let (bytes, request_model) = ensure_openai_include_usage(uri.path(), bytes);
+        *model = request_model;
+        reqwest::Body::from(bytes)
     } else if streamed {
         reqwest::Body::wrap_stream(body.into_data_stream())
     } else {
@@ -352,7 +417,7 @@ const MAX_BUFFERED_BODY: usize = 64 * 1024 * 1024;
 /// Paths whose request bodies may get `stream_options.include_usage` injected, and so
 /// are buffered instead of streamed.
 fn rewrites_request_body(path: &str) -> bool {
-    path.contains("/v1/chat/completions") || path.contains("/v1/completions")
+    parser::is_openai_path(path)
 }
 
 /// Collect a request body, refusing it once it passes `cap` bytes.
@@ -377,25 +442,29 @@ async fn read_capped(body: Body, cap: usize) -> Result<Bytes, ProxyError> {
 /// in the JSON body so Ollama emits a final SSE chunk containing token counts.
 /// Returns the original bytes if the path doesn't match, the body is empty (CORS
 /// preflights, GETs) or isn't valid JSON, or it isn't a JSON object.
-fn ensure_openai_include_usage(path: &str, body: Bytes) -> Bytes {
+///
+/// Also returns the request's model (see `request_model`), taken from the same parse, to
+/// name the request if it fails.
+fn ensure_openai_include_usage(path: &str, body: Bytes) -> (Bytes, Option<String>) {
     if body.is_empty() || !rewrites_request_body(path) {
-        return body;
+        return (body, None);
     }
     let mut value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
             // No body bytes in the log: they can carry prompt text.
             warn!(%path, body_len = body.len(), %err, "v1 request body not parseable as JSON; skipping include_usage injection");
-            return body;
+            return (body, None);
         }
     };
     let Some(obj) = value.as_object_mut() else {
         warn!(%path, "v1 request body is JSON but not an object; skipping include_usage injection");
-        return body;
+        return (body, None);
     };
+    let model = request_model(obj);
     let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
     if !stream {
-        return body; // non-streaming returns usage in the single response anyway
+        return (body, model); // non-streaming returns usage in the single response anyway
     }
     let had_stream_options = obj.contains_key("stream_options");
     let opts = obj
@@ -409,12 +478,24 @@ fn ensure_openai_include_usage(path: &str, body: Bytes) -> Bytes {
     }
     debug!(%path, had_stream_options, "include_usage injected into streaming v1 request");
     match serde_json::to_vec(&value) {
-        Ok(v) => Bytes::from(v),
+        Ok(v) => (Bytes::from(v), model),
         Err(err) => {
             warn!(%path, %err, "re-serializing v1 request body failed; forwarding original");
-            body
+            (body, model)
         }
     }
+}
+
+/// Longest `model` value kept for a failed request.
+const MAX_MODEL_NAME: usize = 256;
+
+/// The request's `model` if it's a plausible name: a non-empty string of at most
+/// `MAX_MODEL_NAME` bytes with no control characters. It comes from the client, and the
+/// headless line prints it as it is.
+fn request_model(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let model = obj.get("model")?.as_str()?;
+    (!model.is_empty() && model.len() <= MAX_MODEL_NAME && !model.chars().any(char::is_control))
+        .then(|| model.to_string())
 }
 
 fn stats_to_record(stats: ParsedStats, session_id: i64) -> InferenceRecord {
@@ -448,7 +529,7 @@ enum ProxyError {
     UnsupportedMethod,
 }
 
-impl axum::response::IntoResponse for ProxyError {
+impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = match self {
             ProxyError::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
@@ -499,12 +580,13 @@ mod tests {
         let body = Bytes::from(
             r#"{"model":"qwen3:14b","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
         );
-        let out = ensure_openai_include_usage("/v1/chat/completions", body);
+        let (out, model) = ensure_openai_include_usage("/v1/chat/completions", body);
         let v = val(&out);
         assert_eq!(
             v["stream_options"]["include_usage"],
             serde_json::json!(true)
         );
+        assert_eq!(model.as_deref(), Some("qwen3:14b"));
     }
 
     #[test]
@@ -512,38 +594,42 @@ mod tests {
         let body = Bytes::from(
             r#"{"model":"x","messages":[],"stream":true,"stream_options":{"include_usage":false,"foo":"bar"}}"#,
         );
-        let out = ensure_openai_include_usage("/v1/chat/completions", body);
+        let (out, model) = ensure_openai_include_usage("/v1/chat/completions", body);
         let v = val(&out);
         assert_eq!(
             v["stream_options"]["include_usage"],
             serde_json::json!(true)
         );
         assert_eq!(v["stream_options"]["foo"], serde_json::json!("bar"));
+        assert_eq!(model.as_deref(), Some("x"));
     }
 
     #[test]
     fn skips_non_streaming() {
         let body_str = r#"{"model":"x","messages":[],"stream":false}"#;
         let body = Bytes::from(body_str);
-        let out = ensure_openai_include_usage("/v1/chat/completions", body);
+        let (out, model) = ensure_openai_include_usage("/v1/chat/completions", body);
         // Non-streaming: untouched (usage is in the single response anyway).
         assert_eq!(std::str::from_utf8(&out).unwrap(), body_str);
+        assert_eq!(model.as_deref(), Some("x"));
     }
 
     #[test]
     fn skips_non_openai_path() {
         let body_str = r#"{"model":"x","messages":[],"stream":true}"#;
         let body = Bytes::from(body_str);
-        let out = ensure_openai_include_usage("/api/chat", body);
+        let (out, model) = ensure_openai_include_usage("/api/chat", body);
         assert_eq!(std::str::from_utf8(&out).unwrap(), body_str);
+        assert_eq!(model.as_deref(), None);
     }
 
     #[test]
     fn skips_invalid_json() {
         let body_str = "not json {{";
         let body = Bytes::from(body_str);
-        let out = ensure_openai_include_usage("/v1/chat/completions", body);
+        let (out, model) = ensure_openai_include_usage("/v1/chat/completions", body);
         assert_eq!(std::str::from_utf8(&out).unwrap(), body_str);
+        assert_eq!(model.as_deref(), None);
     }
 
     #[test]
@@ -551,19 +637,45 @@ mod tests {
         // OpenAI default is non-streaming, but Ollama clients often omit stream and rely on
         // server default. Treat missing as streaming so we still capture.
         let body = Bytes::from(r#"{"model":"x","messages":[]}"#);
-        let out = ensure_openai_include_usage("/v1/chat/completions", body);
+        let (out, model) = ensure_openai_include_usage("/v1/chat/completions", body);
         let v = val(&out);
         assert_eq!(
             v["stream_options"]["include_usage"],
             serde_json::json!(true)
         );
+        assert_eq!(model.as_deref(), Some("x"));
     }
 
     #[test]
     fn skips_empty_body() {
         // CORS preflights (OPTIONS) and GETs carry no body: nothing to rewrite or warn about.
-        let out = ensure_openai_include_usage("/v1/chat/completions", Bytes::new());
+        let (out, model) = ensure_openai_include_usage("/v1/chat/completions", Bytes::new());
         assert!(out.is_empty());
+        assert_eq!(model.as_deref(), None);
+    }
+
+    #[test]
+    fn request_model_keeps_only_plausible_names() {
+        let model = |v: serde_json::Value| request_model(v.as_object().unwrap());
+        assert_eq!(
+            model(serde_json::json!({"model": "deepseek-v4-pro:cloud"})).as_deref(),
+            Some("deepseek-v4-pro:cloud")
+        );
+        let longest = "m".repeat(MAX_MODEL_NAME);
+        assert_eq!(
+            model(serde_json::json!({ "model": longest })).as_deref(),
+            Some(longest.as_str())
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"model": ""}),
+            serde_json::json!({"model": 7}),
+            serde_json::json!({ "model": "m".repeat(MAX_MODEL_NAME + 1) }),
+            serde_json::json!({"model": "evil\u{1b}[2J"}),
+            serde_json::json!({"model": "two\nlines"}),
+        ] {
+            assert_eq!(model(bad.clone()), None, "{bad}");
+        }
     }
 
     fn sse_frame(json: &str) -> Bytes {
@@ -696,22 +808,44 @@ mod tests {
         );
     }
 
-    /// Serves `mock` as the upstream and a real proxy in front of it, both on
-    /// `127.0.0.1:0`. Hold on to the returned `watch::Sender`: dropping it reads as a
-    /// shutdown signal.
-    async fn spawn_proxy(
-        mock: Router,
-    ) -> (String, mpsc::Receiver<InferenceRecord>, watch::Sender<bool>) {
+    /// A real proxy on `127.0.0.1:0`. Keep the whole struct alive and use its fields:
+    /// dropping `_shutdown_tx` reads as a shutdown signal, and `let TestProxy { url, .. }`
+    /// drops it straight away.
+    struct TestProxy {
+        url: String,
+        records_rx: mpsc::Receiver<InferenceRecord>,
+        failures_rx: mpsc::Receiver<FailedRequest>,
+        _shutdown_tx: watch::Sender<bool>,
+    }
+
+    fn start_proxy(upstream_url: String) -> TestProxy {
+        let listener = bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (records_tx, records_rx) = mpsc::channel(4);
+        let (failures_tx, failures_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(serve(
+            listener,
+            upstream_url,
+            7,
+            records_tx,
+            failures_tx,
+            shutdown_rx,
+        ));
+        TestProxy {
+            url,
+            records_rx,
+            failures_rx,
+            _shutdown_tx: shutdown_tx,
+        }
+    }
+
+    /// Serves `mock` as the upstream on `127.0.0.1:0`, with a proxy in front of it.
+    async fn spawn_proxy(mock: Router) -> TestProxy {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(upstream, mock).await });
-
-        let listener = bind("127.0.0.1:0").unwrap();
-        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-        let (records_tx, records_rx) = mpsc::channel(4);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        tokio::spawn(serve(listener, upstream_url, 7, records_tx, shutdown_rx));
-        (proxy_url, records_rx, shutdown_tx)
+        start_proxy(upstream_url)
     }
 
     /// Real sockets end to end: client → proxy → mock upstream replaying a captured stream.
@@ -727,10 +861,10 @@ mod tests {
                 )
             }),
         );
-        let (proxy_url, mut records_rx, _shutdown_tx) = spawn_proxy(mock).await;
+        let mut proxy = spawn_proxy(mock).await;
 
         let body = reqwest::Client::new()
-            .post(format!("{proxy_url}/api/chat"))
+            .post(format!("{}/api/chat", proxy.url))
             .body(r#"{"model":"qwen3:14b","messages":[{"role":"user","content":"hi"}]}"#)
             .send()
             .await
@@ -740,11 +874,143 @@ mod tests {
             .unwrap();
         assert_eq!(body, STREAM, "client must see upstream's bytes unchanged");
 
-        let record = records_rx.recv().await.expect("record should be emitted");
+        let record = proxy
+            .records_rx
+            .recv()
+            .await
+            .expect("record should be emitted");
         assert_eq!(record.session_id, 7);
         assert_eq!(record.model_id, "qwen3:14b");
         assert_eq!(record.envelope, "ollama-stream");
         assert!(record.gen_tokens > 0);
+        assert!(
+            proxy.failures_rx.try_recv().is_err(),
+            "a 200 was reported as failed"
+        );
+    }
+
+    /// A 4xx or 5xx on an inference path passes through unchanged, is reported (with the
+    /// model when the proxy read the body) and records nothing. Other paths aren't reported.
+    #[tokio::test]
+    async fn failed_inference_requests_are_reported() {
+        const V1_ERROR: &str = r#"{"error":{"message":"too many requests","type":"api_error"}}"#;
+        const NATIVE_ERROR: &str = r#"{"error":"model 'qwen9' not found"}"#;
+        let mock = Router::new()
+            .route(
+                "/api/tags",
+                axum::routing::get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "tags failed") }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        V1_ERROR,
+                    )
+                }),
+            )
+            .route(
+                "/api/chat",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::NOT_FOUND,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        NATIVE_ERROR,
+                    )
+                }),
+            );
+        let mut proxy = spawn_proxy(mock).await;
+        let client = reqwest::Client::new();
+
+        // Reporting happens before the response goes out, so `try_recv` is deterministic
+        // once the client has it. The untracked path goes first: a wrong report for it
+        // would come out of the queue ahead of the others.
+        let resp = client
+            .get(format!("{}/api/tags", proxy.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.text().await.unwrap(), "tags failed");
+
+        let resp = client
+            .post(format!("{}/v1/chat/completions", proxy.url))
+            .body(
+                r#"{"model":"deepseek-v4-pro:cloud","messages":[{"role":"user","content":"hi"}]}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.text().await.unwrap(), V1_ERROR, "error body changed");
+        let failure = proxy.failures_rx.try_recv().expect("v1 failure reported");
+        assert_eq!(failure.path, "/v1/chat/completions");
+        assert_eq!(
+            (failure.status, failure.source),
+            (429, FailureSource::Ollama)
+        );
+        assert_eq!(failure.model_id.as_deref(), Some("deepseek-v4-pro:cloud"));
+        assert_eq!(failure.session_id, 7);
+
+        let resp = client
+            .post(format!("{}/api/chat", proxy.url))
+            .body(r#"{"model":"qwen9","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            NATIVE_ERROR,
+            "error body changed"
+        );
+        let failure = proxy
+            .failures_rx
+            .try_recv()
+            .expect("native failure reported");
+        assert_eq!(failure.path, "/api/chat");
+        assert_eq!(
+            (failure.status, failure.source),
+            (404, FailureSource::Ollama)
+        );
+        assert_eq!(
+            failure.model_id, None,
+            "native bodies stream through unread"
+        );
+
+        assert!(proxy.failures_rx.try_recv().is_err());
+        assert!(
+            proxy.records_rx.try_recv().is_err(),
+            "a failed request produced a record"
+        );
+    }
+
+    /// With Ollama unreachable the proxy answers 502 itself, and the report says so.
+    #[tokio::test]
+    async fn unreachable_upstream_is_a_proxy_failure() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let mut proxy = start_proxy(upstream_url);
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", proxy.url))
+            .body(r#"{"model":"qwen3:14b","messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+        let failure = proxy
+            .failures_rx
+            .try_recv()
+            .expect("proxy failure reported");
+        assert_eq!(
+            (failure.status, failure.source),
+            (502, FailureSource::Proxy)
+        );
+        assert_eq!(failure.model_id.as_deref(), Some("qwen3:14b"));
+        assert_eq!(failure.summary(), "proxy (HTTP 502)");
     }
 
     /// An upload bigger than the buffering cap (an `ollama create` blob push) streams
@@ -766,11 +1032,11 @@ mod tests {
                 format!("{received} {declared}")
             }),
         );
-        let (proxy_url, _records_rx, _shutdown_tx) = spawn_proxy(mock).await;
+        let proxy = spawn_proxy(mock).await;
 
         let size = MAX_BUFFERED_BODY + 1;
         let resp = reqwest::Client::new()
-            .post(format!("{proxy_url}/api/blobs/sha256:abc"))
+            .post(format!("{}/api/blobs/sha256:abc", proxy.url))
             .body(vec![7u8; size])
             .send()
             .await
@@ -791,7 +1057,6 @@ mod tests {
 
     #[test]
     fn body_errors_map_to_client_error_statuses() {
-        use axum::response::IntoResponse;
         assert_eq!(
             ProxyError::BodyTooLarge.into_response().status(),
             StatusCode::PAYLOAD_TOO_LARGE

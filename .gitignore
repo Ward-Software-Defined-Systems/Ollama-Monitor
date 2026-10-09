@@ -23,8 +23,7 @@
 .AppleDouble
 .LSOverride
 # Finder's custom-icon file is literally "Icon\r"; git strips one trailing CR, hence two
-Icon
-
+Icon
 ._*
 .DocumentRevisions-V100
 .fseventsd
