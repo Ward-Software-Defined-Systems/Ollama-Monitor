@@ -20,7 +20,7 @@ mod proxy;
 mod tui;
 
 use crate::api::ModelsSnapshot;
-use crate::db::{DbHandle, InferenceRecord};
+use crate::db::{DbHandle, FailedRequest, InferenceRecord};
 use crate::hardware::HardwareSnapshot;
 
 #[derive(Parser, Debug, Clone)]
@@ -42,7 +42,7 @@ pub struct Cli {
     #[arg(long)]
     pub db: Option<PathBuf>,
 
-    /// Headless mode: print one summary line per completed inference to stderr; no TUI.
+    /// Headless mode: print one summary line per completed or failed inference request to stderr; no TUI.
     #[arg(long)]
     pub no_tui: bool,
 }
@@ -99,6 +99,7 @@ async fn async_main(
     info!(session_id, "db opened, session started");
 
     let (records_tx, records_rx) = mpsc::channel::<InferenceRecord>(256);
+    let (failures_tx, failures_rx) = mpsc::channel::<FailedRequest>(256);
 
     // proxy
     let serve = proxy::serve(
@@ -106,6 +107,7 @@ async fn async_main(
         cli.ollama_url.clone(),
         session_id,
         records_tx.clone(),
+        failures_tx,
         shutdown_rx.clone(),
     );
     let mut workers = vec![tokio::spawn(async move {
@@ -137,7 +139,13 @@ async fn async_main(
     let ui_result = if cli.no_tui {
         // Headless has no models or hardware panels, so the poller and the sampler (with
         // its telemetry child) never start.
-        run_headless(records_rx, db_handle.clone(), shutdown_rx.clone()).await
+        run_headless(
+            records_rx,
+            failures_rx,
+            db_handle.clone(),
+            shutdown_rx.clone(),
+        )
+        .await
     } else {
         let (models_tx, models_rx) = mpsc::channel::<ModelsSnapshot>(8);
         let (hw_tx, hw_rx) = mpsc::channel::<HardwareSnapshot>(8);
@@ -150,6 +158,7 @@ async fn async_main(
         tui::run(
             session_id,
             records_rx,
+            failures_rx,
             models_rx,
             hw_rx,
             db_handle.clone(),
@@ -186,6 +195,7 @@ async fn async_main(
 
 async fn run_headless(
     mut records_rx: mpsc::Receiver<InferenceRecord>,
+    mut failures_rx: mpsc::Receiver<FailedRequest>,
     db: DbHandle,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -218,6 +228,19 @@ async fn run_headless(
                     if approx { ", approx" } else { "" },
                 );
                 let _ = db.persist(record).await;
+            }
+            // `Some(..)`, unlike the records arm: if the failures channel closes, only this
+            // arm stops.
+            Some(failure) = failures_rx.recv() => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[{}] {} | {} {}",
+                    failure.failed_at.with_timezone(&chrono::Local).format("%H:%M:%S"),
+                    failure.model_id.as_deref().unwrap_or("?"),
+                    failure.summary(),
+                    failure.path,
+                );
+                let _ = db.persist_failure(failure).await;
             }
         }
     }

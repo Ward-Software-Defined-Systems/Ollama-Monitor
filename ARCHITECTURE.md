@@ -12,9 +12,10 @@ One OS process and one multi-threaded `tokio` runtime, plus a plain thread for k
 clients ──HTTP──▶ proxy (axum) ──reqwest──▶ Ollama
                     │
                     │ tracked paths: a per-request driver task
-                    │ tees each chunk into a parser::Accumulator
+                    │ tees each chunk into a parser::Accumulator;
+                    │ the handler reports a 4xx / 5xx answer itself
                     ▼
-               records_tx (256)
+       records_tx (256), failures_tx (256)
                     ▼
          ┌─────────────────────┐    persist     ┌──────────────────┐
          │ TUI run loop        │───────────────▶│ db writer        │──▶ usage.db
@@ -36,19 +37,19 @@ shutdown: watch<bool> reaches every task; q / Ctrl-C / SIGINT / SIGTERM set it
 | file | role |
 |---|---|
 | `src/main.rs` | CLI, startup order, task wiring, signal handling, TUI vs headless, the 3 s shutdown drain |
-| `src/proxy.rs` | `bind` (fail-fast listener) and `serve` (an axum fallback handler that forwards every path via reqwest); the OpenAI `include_usage` rewrite; the per-request driver task that tees tracked responses into the parser and emits `InferenceRecord`s |
-| `src/parser.rs` | `classify` picks an envelope from path + content type; `Accumulator` drains NDJSON / SSE frames as they arrive and `finalize()`s into `ParsedStats`; `ParsedStats::is_load_or_unload` |
+| `src/proxy.rs` | `bind` (fail-fast listener) and `serve` (an axum fallback handler that forwards every path via reqwest); the OpenAI `include_usage` rewrite; the per-request driver task that tees tracked responses into the parser and emits `InferenceRecord`s; `report_failure`, which turns a 4xx / 5xx on a tracked path into a `FailedRequest` |
+| `src/parser.rs` | `is_inference_path` (the tracked paths); `classify` picks an envelope from path + content type; `Accumulator` drains NDJSON / SSE frames as they arrive and `finalize()`s into `ParsedStats`; `ParsedStats::is_load_or_unload` |
 | `src/api.rs` | `poll_models`: `GET /api/version`, then `/api/tags` + `/api/ps` concurrently; `merge_models` turns them into LMS-shaped `ModelInfo` rows (state loaded / cloud / not-loaded); `resolve_model_id` maps a record's model name to its row for the `▸` marker |
 | `src/aggregate.rs` | The session's records in memory; 1m / 5m / 15m / session windows; mean / p50 / p95; per-model breakdown |
 | `src/pricing.rs` | `FRONTIER_MODELS` (the cost columns); the baked-in `pricing.toml` merged with user overrides; `hypothetical_cost` |
-| `src/db.rs` | SQLite schema, the writer task behind `DbHandle`, sessions, `lifetime_totals` |
+| `src/db.rs` | `InferenceRecord` and `FailedRequest`; the SQLite schema (v2), the writer task behind `DbHandle`, sessions, `lifetime_totals` |
 | `src/config.rs` | Per-platform directories for db / config / log (Application Support on macOS, XDG on Linux); the optional user TOML |
 | `src/hardware/mod.rs` | `sysinfo` CPU / memory and Ollama process detection; `prime` and the shared reader task for the telemetry child, with the platform backend chosen at compile time |
 | `src/hardware/powermetrics.rs` | macOS backend: `sudo -v`, the `sudo -n powermetrics` command and its GPU residency / ANE power parser |
 | `src/hardware/nvidia_smi.rs` | Linux backend: the `nvidia-smi` loop command and its CSV parser (GPU utilization, VRAM used, aggregated across GPUs) |
 | `src/tui/mod.rs` | `AppState`, the event loop, `render()`, the lifetime poller, the input thread, panic-safe terminal restore |
 | `src/tui/layout.rs` | Top-to-bottom panel layout, byte-identical to LMS-Monitor's |
-| `src/tui/widgets.rs` | Per-panel render functions, ported from LMS-Monitor |
+| `src/tui/widgets.rs` | Per-panel render functions, ported from LMS-Monitor; `FeedEntry`, a completed or failed request in the feed |
 
 ## Event source: the design pivot
 
@@ -61,6 +62,7 @@ So instead of subscribing to a log stream, this app **becomes** the path the res
 - An axum reverse proxy listens on `--proxy-listen` (default `127.0.0.1:11435`) and forwards every request to `--ollama-url` (default `http://127.0.0.1:11434`).
 - For tracked inference paths (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`), each upstream chunk is forwarded to the client unchanged and also fed to a per-request `parser::Accumulator`.
 - When the response finishes, the accumulator is finalised; if it found usable stats, an `InferenceRecord` goes to `records_tx`.
+- A 4xx or 5xx response on those paths isn't parsed; a `FailedRequest` goes to `failures_tx` instead.
 
 Clients must point at the proxy port (or the user moves Ollama to another port and gives `:11434` to the proxy). That is the cost of capturing real per-inference stats. Direct hits on Ollama's port are not captured, by design.
 
@@ -74,8 +76,9 @@ For each request the handler:
 2. Forwards the method, path + query and headers through one shared `reqwest::Client`, dropping the hop-by-hop headers and `Host`. `Content-Length` is kept for a streamed body, which arrives unchanged, and dropped for a buffered one, whose length reqwest sets after any rewrite. The client has no overall timeout (a long generation must not be cut off), a 90 s idle-pool timeout and `TCP_NODELAY`. It's built without decompression features, so bytes arrive exactly as Ollama sent them.
 3. Returns Ollama's status and headers, minus the hop-by-hop headers and `Content-Length`, so response bodies always go out chunked.
 4. Tees the body (see [Streaming response tee](#streaming-response-tee)) only when the status is 2xx and `parser::classify` recognises the path; everything else streams straight through.
+5. On a tracked path, reports a 4xx or 5xx response as a failed request (see [Failed requests](#failed-requests)).
 
-The proxy's own errors are 502 (Ollama unreachable), 413 (a buffered body over 64 MiB), 400 (a request body it can't read), 500 (a response it can't build) and 405 (a method reqwest can't represent).
+The proxy's own errors are 502 (Ollama unreachable), 413 (a buffered body over 64 MiB), 400 (a request body it can't read), 500 (a response it can't build) and 405 (a method reqwest can't represent). On a tracked path they're failed requests too.
 
 Because reqwest sets `Host` from `--ollama-url`, Ollama never sees the client's `Host`. Ollama's DNS-rebinding protection (while it listens on loopback it accepts only local host names) therefore doesn't cover requests that arrive through the proxy. The client's `Origin` header is forwarded untouched, so Ollama's CORS check still applies.
 
@@ -97,6 +100,16 @@ Each tracked upstream response is a `futures_util::Stream<Item = Result<Bytes, _
 4. The task then calls `finalize()`. Usable stats become an `InferenceRecord` (stamped `completed_at = now`) sent to `records_tx`. Ollama model load / unload calls (`ParsedStats::is_load_or_unload`) are the exception: they're logged at debug and dropped. No usable stats means an info log line, `no parsable stats in response`, and no record.
 
 Failure isolation: parser trouble never changes what the client receives; the client gets every byte Ollama produced, in order. One known gap: an upstream error mid-body ends the client's response as if it were complete (the tee path closes the channel; the untracked path yields an empty chunk) instead of aborting the connection, so a client can't tell a truncated body from a whole one.
+
+## Failed requests
+
+`proxy::handle` wraps `forward`, which does everything in the request path above. When the path is tracked (`parser::is_inference_path`: the four inference paths) and the client's response is a 4xx or 5xx, `report_failure` builds a `FailedRequest`. Its fields are the time, path, status, model when known, and source. The source is `ollama` for a status Ollama sent, including one it relays from ollama.com for a `:cloud` model, and `proxy` for one of the proxy's own errors. A 3xx isn't a failure: gin answers a trailing slash (`/api/chat/`) with a redirect.
+
+- **Status code only.** The error body is a response body: it streams to the client untouched, and nothing reads, logs or stores it.
+- **Model from the request.** Only the OpenAI-compatible paths buffer their request bodies, so only they have a model. `ensure_openai_include_usage` returns the `model` field from the parse it already does, if it's a non-empty string of at most 256 bytes without control characters; headless mode prints it as is. Native bodies stream through unread, so a native failed request has no model and the feed shows `?`. Neither does a 413 or 400, whose body was never read. A failed row names the model the way the request did (`deepseek-v4-pro:cloud`); a completed row has the response's name (`deepseek-v4-pro`). The `▸` resolves both.
+- **Synchronous reporting.** `report_failure` writes one info line (`inference request failed`, with path, status, model and source), then calls `try_send` on `failures_tx`. Nothing is awaited between learning the status and returning the response, so reporting can't delay the client. A full or closed channel drops the report with a warning.
+- **Client hang-ups.** A client that hangs up before its response is ready isn't reported: hyper drops the handler with the connection. The exception is a client that aborts while a native body is still uploading. reqwest's send fails, so the request is reported as `proxy (HTTP 502)`.
+- **Errors inside a 2xx stream.** An error that arrives after a 2xx response has started isn't a failed request, because the status was already sent. Examples are a native `{"error": …}` line or an error frame in an OpenAI stream. The stream ends like any cut-off stream (see the table below).
 
 ## Capture outcomes
 
@@ -139,18 +152,20 @@ For OpenAI SSE, `gen_window = wall_total - wall_ttft`, floored at 50 ms. For Ope
 | OpenAI SSE with no data frames at all | dropped |
 | native stream ends before its `done: true` line (client abort, truncation) | dropped |
 | native response to a model load / unload (`done_reason` `load` / `unload`) | dropped (debug log) |
-| non-2xx response | not parsed |
+| 4xx / 5xx response on a tracked path, from Ollama or the proxy | not parsed; saved to `failed_requests` and shown as a red feed row (see [Failed requests](#failed-requests)) |
+| 3xx response (gin's trailing-slash redirect) | passed through, not parsed |
 | embeddings (`/api/embed`), `/api/tags`, pulls, blobs and every other path | passed through, not parsed |
 
 ## Record lifecycle
 
-Each captured request is persisted exactly once, by whichever loop owns `records_rx`: the TUI run loop or, with `--no-tui`, the headless loop. Both send every record to `DbHandle::persist`, whatever the UI is doing. The UI's view is separate and lossy by design:
+Each captured request, and each failed one, is persisted exactly once, by whichever loop owns `records_rx` and `failures_rx`: the TUI run loop or, with `--no-tui`, the headless loop. Both send every record to `DbHandle::persist` and every failed request to `DbHandle::persist_failure`, whatever the UI is doing. The UI's view is separate and lossy by design:
 
-- The feed keeps the newest 30 records (`FEED_CAPACITY`).
+- The feed keeps the newest 30 entries (`FEED_CAPACITY`), completed and failed alike, in arrival order.
+- Failed requests go to the feed only: never the aggregator, the cost panel or the lifetime totals, which count `inference_records`. One with a known model moves the `▸`; one without leaves it where it was.
 - `r` clears the feed and the aggregator; the database and the lifetime totals keep everything.
-- While paused (`p`), records are persisted but not ingested: they never reach the feed, the aggregator, the cost panel or the `▸` marker, even after resuming.
+- While paused (`p`), records and failed requests are persisted but not ingested: they never reach the feed, the aggregator, the cost panel or the `▸` marker, even after resuming.
 
-So `inference_records` is the complete history, and the panels show the session since launch or the last reset, minus anything that arrived while paused.
+So `inference_records` and `failed_requests` are the complete history, and the panels show the session since launch or the last reset, minus anything that arrived while paused.
 
 ## Aggregator
 
@@ -162,17 +177,20 @@ Cross-session totals come from `db::lifetime_totals` instead: the TUI's lifetime
 
 ## Persistence
 
-SQLite via bundled `rusqlite`, in the default rollback-journal mode. The schema is applied idempotently (`CREATE … IF NOT EXISTS`) on every open; `schema_version` holds `1`, and there are no migrations yet.
+SQLite via bundled `rusqlite`, in the default rollback-journal mode. On every open the schema is applied idempotently: `V1_SQL` (frozen), then `V2_SQL`, both `CREATE … IF NOT EXISTS`. `V2_SQL` ends with an `INSERT OR IGNORE` that gives `schema_version` one row per version applied, 1 and 2.
 
 | table | columns |
 |---|---|
 | `sessions` | `id` INTEGER PK, `started_at` TEXT, `ended_at` TEXT (NULL until a clean shutdown) |
 | `inference_records` | `id` INTEGER PK, `session_id` → `sessions.id`, `completed_at` TEXT, `model_id` TEXT, `prompt_tokens` INTEGER, `gen_tokens` INTEGER, `tokens_per_sec` REAL, `ttft_sec` REAL, `total_time_sec` REAL, `stop_reason` TEXT, `envelope` TEXT |
+| `failed_requests` (v2) | `id` INTEGER PK, `session_id` → `sessions.id`, `failed_at` TEXT, `model_id` TEXT (NULL when unknown), `path` TEXT, `status` INTEGER, `source` TEXT (`ollama` or `proxy`) |
 | `schema_version` | `version` INTEGER PK |
 
-Timestamps are RFC 3339 strings in UTC (`2026-10-03T23:53:26.322907+00:00`). `envelope` is one of the five strings in the mapping table above; filter on `openai-sse-approx` to separate estimated rows. Indexes cover `inference_records(session_id)` and `inference_records(model_id)`.
+Timestamps are RFC 3339 strings in UTC (`2026-10-03T23:53:26.322907+00:00`). `envelope` is one of the five strings in the mapping table above; filter on `openai-sse-approx` to separate estimated rows. Indexes cover `inference_records(session_id)`, `inference_records(model_id)` and `failed_requests(session_id)`.
 
-All writes go through one writer: `db::open_and_spawn_writer` runs a loop on tokio's blocking pool (`spawn_blocking` + `blocking_recv`) that owns the connection, and `DbHandle` is a cloneable `mpsc::Sender` (256) for its commands. Each record is its own autocommit `INSERT`. The lifetime poller's second connection is an ordinary read-write one that only ever reads. The writer keeps rusqlite's default 5 s busy timeout and the reader sets 500 ms, which covers the brief locks rollback journaling takes.
+v2 only added `failed_requests`, so there is no migration step: opening a v1 file creates the table and records version 2. A monitor built before v2 keeps working on a v2 file, even while a newer one runs on it. Its schema SQL is all no-ops there, its version check (`SELECT version … LIMIT 1`) finds 1, and it never touches the new table. Each statement commits on its own under the 5 s busy timeout, so an upgrade next to a running writer just waits its turn. LMS-Monitor's v2 needed an `IMMEDIATE` transaction only because it alters a table after reading it.
+
+All writes go through one writer: `db::open_and_spawn_writer` runs a loop on tokio's blocking pool (`spawn_blocking` + `blocking_recv`) that owns the connection, and `DbHandle` is a cloneable `mpsc::Sender` (256) for its commands. Each record and each failed request is its own autocommit `INSERT`. The lifetime poller's second connection is an ordinary read-write one that only ever reads. The writer keeps rusqlite's default 5 s busy timeout and the reader sets 500 ms, which covers the brief locks rollback journaling takes.
 
 A session row is inserted at startup and its `ended_at` filled in on a clean shutdown (see [Startup and shutdown](#startup-and-shutdown)). Closing the terminal window (SIGHUP) and a TUI error both still end the session cleanly; only a crash or a `kill -9` leaves it NULL.
 
@@ -233,12 +251,12 @@ Two sources, merged into one `HardwareSnapshot` every 2 s. The sampler runs only
 | header | 3 | `ollama-monitor · server: ● reachable/unreachable/unknown (url) · err · [PAUSED] · lifetime: reqs / sessions / prompt tok / gen tok · local clock`; Ollama-only `ollama vX · proxy ADDR` right-aligned in the top border |
 | loaded models | 6 (3 model rows) | every `/api/tags` model merged with `/api/ps`, sorted loaded → cloud → not-loaded: id · type · compat · quant · ctx · state, `▸` on the most recent inference target. Rows past the third are cut off |
 | hardware | 3 | one line: system CPU / MEM (free) │ Ollama CPU / RSS / process count │ GPU / ANE (macOS) or GPU / VRAM (Linux) |
-| live feed | `Min(7)` (4 records at 36 rows) | up to 30 records, newest first: local completion time · model · prompt · gen · TTFT ms · tok/s · stop; `~` marks approximate (`openai-sse-approx`) rows |
+| live feed | `Min(7)` (4 entries at 36 rows) | up to 30 entries, newest first: local completion time · model · prompt · gen · TTFT ms · tok/s · stop (25 columns, LMS-Monitor's width); `~` marks approximate (`openai-sse-approx`) rows. A failed request is a whole red row: time, model or `?`, four `-`, then `failed (HTTP 429)` or `proxy (HTTP 502)` |
 | rolling metrics | 9 | `1m / 5m / 15m / session` columns; rows: requests, prompt tok, gen tok, mean tok/s, p95 tok/s, mean TTFT |
 | hypothetical cost | 7 | frontier models as columns; input / output / total USD rows for the session |
 | footer | 1 | `q quit · r reset session · p pause` |
 
-Feed time is completion time (LMS-Monitor shows start time) because Ollama-Monitor's rolling windows, DB rows and feed order are all keyed on `completed_at`.
+Feed time is completion time (LMS-Monitor shows start time) because Ollama-Monitor's rolling windows, DB rows and feed order are all keyed on `completed_at`. A failed row's time is when its status was known.
 
 The `▸` marker needs name normalisation: OpenAI-compatible responses report `deepseek-v4-pro` for the `deepseek-v4-pro:cloud` tag, and `qwen3` for `qwen3:latest`. `api::canonical_model_name` lowercases and strips `:latest`, `:cloud` and a `-cloud` tag suffix; an exact id match always wins over a canonical one. The marker is resolved on every frame, so a record that lands before the first `/api/tags` poll still gets it once the list arrives. While Ollama is unreachable, the last model list and version stay on screen.
 
@@ -262,7 +280,7 @@ Restoring always goes through `ratatui::try_restore()`, with errors only logged 
 
 The filter comes from `OLLAMA_MONITOR_LOG` (default `info`). `tracing-subscriber`'s default `tracing-log` feature bridges the `log` crate (reqwest uses it), and hyper-util and h2 emit tracing events of their own, so a bare `debug` or `trace` includes library noise; scope it with `ollama_monitor=debug`. Lines don't carry their target, so library lines aren't labelled as such.
 
-At the default level the log holds startup and shutdown lines, warnings, and a line for each tracked request that yields no stats. Request and response bodies never reach it: the proxy logs metadata (method, path, status, model, token counts), never content.
+At the default level the log holds startup and shutdown lines, warnings, a line for each tracked request that yields no stats, and one for each failed request (`inference request failed`). Request and response bodies never reach it: the proxy logs metadata (method, path, status, model, token counts), never content.
 
 ## Startup and shutdown
 
@@ -291,9 +309,13 @@ All tests run without Ollama, sudo, a GPU or a terminal:
 
 - **Parser**: fixture-driven (`fixtures/`, captured from real Ollama responses), with bodies fed in 64-byte chunks to exercise frame reassembly.
 - **API**: `/api/tags` and `/api/ps` parsing, `merge_models` ordering and states, name canonicalisation.
-- **Proxy**: the request rewrite and its 64 MiB cap; the driver task's behaviour (trailer drain after `finish_reason`, no drain mid-generation, load calls not recorded) on tokio's paused clock; `bind` errors; and end-to-end tests over real sockets (client → `serve` → mock upstream): one checks a response arrives unchanged with exactly one record emitted, another streams an upload just over the buffering cap through intact.
-- **TUI**: renders into ratatui's `TestBackend`. `hardware_row_survives_at_minimum_height` guards the 120×36 minimum, and `screen_snapshot` prints 120×36 and 160×44 screens for eyeballing.
-- **DB, pricing, aggregator, config directories, hardware formatting and both telemetry parsers**: unit tests. The two telemetry backends compile on every platform, so the powermetrics and nvidia-smi parsers are both tested in Linux CI and on a Mac. The DB helper names temp files with a counter, not the clock, so parallel tests can't collide.
+- **Proxy**: the request rewrite and its 64 MiB cap; the driver task's behaviour (trailer drain after `finish_reason`, no drain mid-generation, load calls not recorded) on tokio's paused clock; `bind` errors; and end-to-end tests over real sockets (client → `serve` → mock upstream).
+  - One checks a response arrives unchanged with exactly one record emitted.
+  - One streams an upload just over the buffering cap through intact.
+  - One checks that 4xx / 5xx answers pass through unchanged and that each one on a tracked path is reported once, with the model for the OpenAI path and none for the native one. An untracked path isn't reported.
+  - One checks that an unreachable upstream is reported as `proxy (HTTP 502)`.
+- **TUI**: renders into ratatui's `TestBackend`. `hardware_row_survives_at_minimum_height` guards the 120×36 minimum, and `screen_snapshot` prints 120×36 and 160×44 screens for eyeballing. The feed tests read cell colours from the buffer: a failed row is red end to end and a completed row's `length` stop isn't. Pause, the 30-entry cap and newest-first order apply to failed rows too.
+- **DB, pricing, aggregator, config directories, hardware formatting and both telemetry parsers**: unit tests. The two telemetry backends compile on every platform, so the powermetrics and nvidia-smi parsers are both tested in Linux CI and on a Mac. The DB helper names temp files with a counter, not the clock, so parallel tests can't collide. The DB tests replay a v1 binary's open on the same file around the v2 upgrade.
 
 Two tests are `#[ignore]`d because they touch the real machine: `live_ollama_snapshot` (read-only GETs to `127.0.0.1:11434`) and `live_sysinfo_snapshot`.
 
@@ -301,12 +323,17 @@ GitLab CI (`.gitlab-ci.yml`, shared with LMS-Monitor) runs `cargo fmt --all --ch
 
 ## Notable invariants
 
-- Each captured request is persisted exactly once, by the loop that owns `records_rx`, and the DB writer is the only writer.
+- Each captured request and each failed one is persisted exactly once, by the loop that owns `records_rx` and `failures_rx`, and the DB writer is the only writer.
+- Reporting a failed request never waits: the handler calls `try_send` before it returns the response. Only the status code is kept, never the error body.
 - Responses are forwarded byte for byte. The deliberate exceptions are the OpenAI `include_usage` request rewrite (with its 64 MiB cap on those bodies) and the hop-by-hop / `Host` / `Content-Length` header handling. Parser failures never change what the client sees.
 - The proxy is the only capture path. Direct hits on Ollama's port are invisible by design.
 - Nothing writes to stdout or stderr while the TUI is up.
 - A client abort mid-generation must drop the upstream stream (that's how cancellation reaches Ollama); only a finished stream waiting on its usage frame gets drained.
-- TUI parity with LMS-Monitor: `tui/layout.rs` is byte-identical, and `tui/widgets.rs` differs only in data-model mapping plus the Ollama extras (version / proxy border title, `cloud` state, `~` markers) and the hardware row's Linux `vram` slot, a `cfg!` branch that leaves the macOS rendering unchanged. The `pricing.toml` values match too. Change both apps together.
+- TUI parity with LMS-Monitor: `tui/layout.rs` is byte-identical, and `tui/widgets.rs` differs only in data-model mapping plus the Ollama extras (version / proxy border title, `cloud` state, `~` markers) and the hardware row's Linux `vram` slot, a `cfg!` branch that leaves the macOS rendering unchanged. The red feed rows are the same idea for different events.
+  - Here they're failed requests (`FeedEntry::Failed`, `failed_row`); in LMS-Monitor they're context-overflow refusals (`FeedEntry::Rejected`, `rejected_row`).
+  - LMS's `stop_cell` isn't ported, because no Ollama stop reason means the context ran out (`length` also covers a max-tokens cap).
+
+  The `pricing.toml` values match too. Change both apps together.
 - Pricing keys are TOML-friendly (hyphenated, no dots): `gemini-3-1-pro`, not `gemini-3.1-pro`.
 - The telemetry child is the only subprocess: on macOS `sudo -n powermetrics` (plus the startup `sudo -v`), with no stdin and its own process group; on Linux `nvidia-smi`, unprivileged, with no stdin.
 

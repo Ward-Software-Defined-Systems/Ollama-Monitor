@@ -1,6 +1,11 @@
 //! Per-panel render fns. Ported from LMS-Monitor's `tui/widgets.rs` so the two TUIs stay
 //! visually identical; Ollama-only additions are the header's version/proxy title, the
 //! `cloud` model state, and `~` on approximate feed rows.
+//!
+//! The feed's red rows are requests that got a 4xx or 5xx; LMS-Monitor's are requests
+//! refused for context overflow. Its `stop_cell` isn't ported: no Ollama stop reason means
+//! the context ran out (`length` also covers a max-tokens cap), so completed rows' stop
+//! cells stay plain.
 
 use std::collections::VecDeque;
 
@@ -14,7 +19,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use super::FEED_CAPACITY;
 use crate::aggregate::{AggregateSnapshot, WindowStats};
 use crate::api::ModelInfo;
-use crate::db::{InferenceRecord, LifetimeTotals};
+use crate::db::{FailedRequest, InferenceRecord, LifetimeTotals};
 use crate::hardware::{HardwareSnapshot, format_bytes, format_bytes_ratio};
 use crate::pricing::{FRONTIER_MODELS, HypotheticalCost, PricingTable, hypothetical_cost};
 
@@ -185,8 +190,15 @@ pub fn render_models(
     f.render_widget(table, area);
 }
 
+/// A live-feed row: a request that completed, or one that got a 4xx or 5xx.
+#[derive(Debug, Clone)]
+pub enum FeedEntry {
+    Completed(InferenceRecord),
+    Failed(FailedRequest),
+}
+
 /// `feed` is newest-first already.
-pub fn render_feed(f: &mut Frame, area: Rect, feed: &VecDeque<InferenceRecord>) {
+pub fn render_feed(f: &mut Frame, area: Rect, feed: &VecDeque<FeedEntry>) {
     let header = Row::new(vec![
         Cell::from("time"),
         Cell::from("model"),
@@ -204,28 +216,9 @@ pub fn render_feed(f: &mut Frame, area: Rect, feed: &VecDeque<InferenceRecord>) 
 
     let rows: Vec<Row> = feed
         .iter()
-        .map(|r| {
-            // Cloud-proxy fallback (ollama/ollama#15169): no `usage` block arrived, so gen
-            // and tok/s are chunk-count estimates. A leading `~` flags them at a glance.
-            let approx = if r.envelope == APPROX_ENVELOPE {
-                "~"
-            } else {
-                ""
-            };
-            let stop = if r.stop_reason.is_empty() {
-                "-"
-            } else {
-                r.stop_reason.as_str()
-            };
-            Row::new(vec![
-                Cell::from(feed_time(r, &chrono::Local)),
-                Cell::from(truncate(&r.model_id, 28).to_string()),
-                Cell::from(r.prompt_tokens.to_string()),
-                Cell::from(format!("{approx}{}", r.gen_tokens)),
-                Cell::from(format!("{:.0}ms", r.ttft_sec * 1000.0)),
-                Cell::from(format!("{approx}{:.1}", r.tokens_per_sec)),
-                Cell::from(stop.to_string()),
-            ])
+        .map(|entry| match entry {
+            FeedEntry::Completed(r) => completed_row(r),
+            FeedEntry::Failed(r) => failed_row(r),
         })
         .collect();
 
@@ -236,7 +229,9 @@ pub fn render_feed(f: &mut Frame, area: Rect, feed: &VecDeque<InferenceRecord>) 
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Length(8),
-        Constraint::Length(24),
+        // LMS-Monitor's width, which fits LM Studio's longest stop reason,
+        // `maxPredictedTokensReached`.
+        Constraint::Length(25),
     ];
     let title = format!("live request feed ({}/{FEED_CAPACITY})", feed.len());
     let table = Table::new(rows, widths)
@@ -245,16 +240,56 @@ pub fn render_feed(f: &mut Frame, area: Rect, feed: &VecDeque<InferenceRecord>) 
     f.render_widget(table, area);
 }
 
-/// Feed timestamp in `tz` (`chrono::Local` on screen). LMS-Monitor shows start time; this
-/// shows completion time, which Ollama-Monitor's rolling windows, DB and feed order use.
-pub fn feed_time<Tz: TimeZone>(r: &InferenceRecord, tz: &Tz) -> String
+/// Feed rows of failed requests use this colour.
+const FAILED: Color = Color::Red;
+
+fn completed_row(r: &InferenceRecord) -> Row<'static> {
+    // Cloud-proxy fallback (ollama/ollama#15169): no `usage` block arrived, so gen and
+    // tok/s are chunk-count estimates. A leading `~` flags them at a glance.
+    let approx = if r.envelope == APPROX_ENVELOPE {
+        "~"
+    } else {
+        ""
+    };
+    let stop = if r.stop_reason.is_empty() {
+        "-"
+    } else {
+        r.stop_reason.as_str()
+    };
+    Row::new(vec![
+        Cell::from(feed_time(&r.completed_at, &chrono::Local)),
+        Cell::from(truncate(&r.model_id, 28).to_string()),
+        Cell::from(r.prompt_tokens.to_string()),
+        Cell::from(format!("{approx}{}", r.gen_tokens)),
+        Cell::from(format!("{:.0}ms", r.ttft_sec * 1000.0)),
+        Cell::from(format!("{approx}{:.1}", r.tokens_per_sec)),
+        Cell::from(stop.to_string()),
+    ])
+}
+
+/// No stats came back, so there are no token counts, TTFT or speed; the stop cell holds
+/// the status. The model is `?` when the proxy didn't read the request body.
+fn failed_row(r: &FailedRequest) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(feed_time(&r.failed_at, &chrono::Local)),
+        Cell::from(truncate(r.model_id.as_deref().unwrap_or("?"), 28).to_string()),
+        Cell::from("-"),
+        Cell::from("-"),
+        Cell::from("-"),
+        Cell::from("-"),
+        Cell::from(r.summary()),
+    ])
+    .style(Style::default().fg(FAILED))
+}
+
+/// Feed timestamp in `tz` (`chrono::Local` on screen): when the request completed or
+/// failed. LMS-Monitor shows start time; completion time is what Ollama-Monitor's rolling
+/// windows, DB and feed order use.
+pub fn feed_time<Tz: TimeZone>(t: &DateTime<Utc>, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
 {
-    r.completed_at
-        .with_timezone(tz)
-        .format("%H:%M:%S")
-        .to_string()
+    t.with_timezone(tz).format("%H:%M:%S").to_string()
 }
 
 pub fn render_rolling(f: &mut Frame, area: Rect, snap: &AggregateSnapshot) {
@@ -592,20 +627,9 @@ mod tests {
 
     #[test]
     fn feed_time_uses_given_zone() {
-        let rec = InferenceRecord {
-            session_id: 1,
-            model_id: "m".into(),
-            prompt_tokens: 0,
-            gen_tokens: 0,
-            tokens_per_sec: 0.0,
-            ttft_sec: 0.0,
-            total_time_sec: 0.0,
-            stop_reason: String::new(),
-            completed_at: Utc.with_ymd_and_hms(2026, 10, 3, 19, 4, 5).unwrap(),
-            envelope: "ollama-stream".into(),
-        };
+        let t = Utc.with_ymd_and_hms(2026, 10, 3, 19, 4, 5).unwrap();
         let pdt = FixedOffset::west_opt(7 * 3600).unwrap();
-        assert_eq!(feed_time(&rec, &pdt), "12:04:05");
-        assert_eq!(feed_time(&rec, &Utc), "19:04:05");
+        assert_eq!(feed_time(&t, &pdt), "12:04:05");
+        assert_eq!(feed_time(&t, &Utc), "19:04:05");
     }
 }

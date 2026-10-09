@@ -16,14 +16,14 @@ use tracing::{debug, info, warn};
 
 use crate::aggregate::Aggregator;
 use crate::api::{self, ModelInfo, ModelsSnapshot};
-use crate::db::{DbHandle, InferenceRecord, LifetimeTotals};
+use crate::db::{DbHandle, FailedRequest, InferenceRecord, LifetimeTotals};
 use crate::hardware::HardwareSnapshot;
 use crate::pricing::PricingTable;
 
 mod layout;
 mod widgets;
 
-use widgets::ServerStatus;
+use widgets::{FeedEntry, ServerStatus};
 
 const FEED_CAPACITY: usize = 30;
 const TICK: Duration = Duration::from_millis(250);
@@ -37,7 +37,7 @@ pub struct AppState {
     pub aggregator: Aggregator,
     pub pricing: Arc<PricingTable>,
     /// Newest first.
-    pub feed: VecDeque<InferenceRecord>,
+    pub feed: VecDeque<FeedEntry>,
     pub models: Vec<ModelInfo>,
     pub server_status: ServerStatus,
     pub server_error: Option<String>,
@@ -100,10 +100,27 @@ impl AppState {
         }
         self.last_inference_model_id = Some(record.model_id.clone());
         self.aggregator.ingest(record.clone());
+        self.push_feed(FeedEntry::Completed(record));
+    }
+
+    /// A request that got a 4xx or 5xx. It only goes in the feed: there are no stats for
+    /// the rolling metrics or the cost panel. The run loop persists it, paused or not.
+    fn ingest_failure(&mut self, failure: FailedRequest) {
+        if self.paused {
+            return;
+        }
+        // A native request's model is unknown (its body isn't read); the ▸ stays put.
+        if let Some(model) = &failure.model_id {
+            self.last_inference_model_id = Some(model.clone());
+        }
+        self.push_feed(FeedEntry::Failed(failure));
+    }
+
+    fn push_feed(&mut self, entry: FeedEntry) {
         if self.feed.len() == FEED_CAPACITY {
             self.feed.pop_back();
         }
-        self.feed.push_front(record);
+        self.feed.push_front(entry);
     }
 
     fn reset_session(&mut self) {
@@ -148,6 +165,7 @@ fn render(f: &mut Frame, state: &AppState) {
 pub async fn run(
     session_id: i64,
     mut records_rx: mpsc::Receiver<InferenceRecord>,
+    mut failures_rx: mpsc::Receiver<FailedRequest>,
     mut models_rx: mpsc::Receiver<ModelsSnapshot>,
     mut hw_rx: mpsc::Receiver<HardwareSnapshot>,
     db: DbHandle,
@@ -180,6 +198,7 @@ pub async fn run(
         &shutdown_tx,
         &mut shutdown_rx,
         &mut records_rx,
+        &mut failures_rx,
         &mut models_rx,
         &mut hw_rx,
         &mut lifetime_rx,
@@ -201,6 +220,7 @@ async fn run_loop(
     shutdown_tx: &watch::Sender<bool>,
     shutdown_rx: &mut watch::Receiver<bool>,
     records_rx: &mut mpsc::Receiver<InferenceRecord>,
+    failures_rx: &mut mpsc::Receiver<FailedRequest>,
     models_rx: &mut mpsc::Receiver<ModelsSnapshot>,
     hw_rx: &mut mpsc::Receiver<HardwareSnapshot>,
     lifetime_rx: &mut mpsc::Receiver<LifetimeTotals>,
@@ -231,6 +251,11 @@ async fn run_loop(
                 let to_persist = record.clone();
                 state.ingest_record(record);
                 let _ = db.persist(to_persist).await;
+            }
+            Some(failure) = failures_rx.recv() => {
+                let to_persist = failure.clone();
+                state.ingest_failure(failure);
+                let _ = db.persist_failure(to_persist).await;
             }
             Some(snap) = models_rx.recv() => state.ingest_models(snap),
             Some(hw) = hw_rx.recv() => state.hardware = hw,
@@ -372,6 +397,10 @@ mod tests {
     use chrono::{Local, Offset, TimeZone};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+
+    use crate::db::FailureSource;
 
     const TAGS_CLOUD_FIXTURE: &str = include_str!("../../fixtures/api-tags-cloud.json");
 
@@ -430,10 +459,45 @@ mod tests {
         }
     }
 
-    fn render_to_lines(width: u16, height: u16, state: &AppState) -> Vec<String> {
+    fn failure(model: Option<&str>, status: u16, source: FailureSource) -> FailedRequest {
+        FailedRequest {
+            session_id: 1,
+            failed_at: Utc::now(),
+            model_id: model.map(str::to_string),
+            path: "/v1/chat/completions".into(),
+            status,
+            source,
+        }
+    }
+
+    fn render_buffer(width: u16, height: u16, state: &AppState) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| render(f, state)).unwrap();
-        let buf = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Column and row of the first rendered occurrence of `needle`. Border characters are
+    /// several bytes long, so the byte offset is converted to a column count.
+    fn find(buf: &Buffer, needle: &str) -> (u16, u16) {
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(i) = row.find(needle) {
+                return (row[..i].chars().count() as u16, y);
+            }
+        }
+        panic!("{needle:?} not rendered");
+    }
+
+    /// Foreground colour of each cell `needle` covers.
+    fn fg_of(buf: &Buffer, needle: &str) -> Vec<Color> {
+        let (x0, y) = find(buf, needle);
+        (x0..x0 + needle.chars().count() as u16)
+            .map(|x| buf[(x, y)].fg)
+            .collect()
+    }
+
+    fn render_to_lines(width: u16, height: u16, state: &AppState) -> Vec<String> {
+        let buf = render_buffer(width, height, state);
         (0..buf.area.height)
             .map(|y| {
                 (0..buf.area.width)
@@ -612,6 +676,7 @@ mod tests {
         state.now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
         let mut rec = record("deepseek-v4-pro", "openai-sse");
         rec.completed_at = Utc.with_ymd_and_hms(2026, 1, 2, 3, 0, 9).unwrap();
+        let completed_at = rec.completed_at;
         state.ingest_record(rec);
         // Wide enough that the header clock isn't clipped.
         let lines = render_to_lines(200, 36, &state);
@@ -621,7 +686,7 @@ mod tests {
             .with_timezone(&Local)
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        let local_feed = feed_local(&state.feed[0]);
+        let local_feed = widgets::feed_time(&completed_at, &Local);
         line_with(&lines, &local_clock);
         line_with(&lines, &local_feed);
 
@@ -641,8 +706,77 @@ mod tests {
         }
     }
 
-    fn feed_local(rec: &InferenceRecord) -> String {
-        widgets::feed_time(rec, &Local)
+    #[test]
+    fn failed_request_is_red_in_feed() {
+        let mut state = sample_state();
+        let mut capped = record("model-done", "openai-sse");
+        capped.stop_reason = "length".into();
+        state.ingest_record(capped);
+        state.ingest_failure(failure(Some("model-refused"), 429, FailureSource::Ollama));
+        state.ingest_failure(failure(None, 502, FailureSource::Proxy));
+        let buf = render_buffer(120, 36, &state);
+
+        // A failed request's whole row is red, inside the panel's borders.
+        for (label, model) in [
+            ("failed (HTTP 429)", "model-refused"),
+            ("proxy (HTTP 502)", "?"),
+        ] {
+            let (_, y) = find(&buf, label);
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            assert!(row.contains(model), "{row}");
+            for x in 1..buf.area.width - 1 {
+                let cell = &buf[(x, y)];
+                if cell.symbol() != " " {
+                    assert_eq!(cell.fg, Color::Red, "column {x} of {row:?}");
+                }
+            }
+        }
+        // `length` stays plain: it also means a max-tokens cap, not only a full context.
+        for needle in ["model-done", "length"] {
+            assert!(
+                fg_of(&buf, needle).iter().all(|c| *c != Color::Red),
+                "{needle} is red on a completed row"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_ingest_respects_pause_cap_and_aggregator() {
+        let mut state = sample_state();
+        state.toggle_pause();
+        state.ingest_failure(failure(Some("while-paused"), 429, FailureSource::Ollama));
+        assert!(
+            state.feed.is_empty(),
+            "a failure reached the feed while paused"
+        );
+        assert_eq!(state.last_inference_model_id, None);
+        state.toggle_pause();
+        for _ in 0..FEED_CAPACITY + 5 {
+            state.ingest_failure(failure(Some("m"), 429, FailureSource::Ollama));
+        }
+        assert_eq!(state.feed.len(), FEED_CAPACITY);
+        assert_eq!(state.last_inference_model_id.as_deref(), Some("m"));
+        // A native request's model is unknown; the ▸ stays on the last known one.
+        state.ingest_failure(failure(None, 404, FailureSource::Ollama));
+        assert_eq!(state.last_inference_model_id.as_deref(), Some("m"));
+        assert_eq!(
+            state.aggregator.snapshot(Utc::now()).session.request_count,
+            0,
+            "a failed request counted as a request"
+        );
+    }
+
+    #[test]
+    fn feed_is_newest_first() {
+        let mut state = sample_state();
+        state.ingest_record(record("older-model", "openai-sse"));
+        state.ingest_failure(failure(Some("newer-model"), 429, FailureSource::Ollama));
+        assert!(matches!(
+            &state.feed[0],
+            FeedEntry::Failed(f) if f.model_id.as_deref() == Some("newer-model")
+        ));
+        let buf = render_buffer(120, 36, &state);
+        assert!(find(&buf, "newer-model").1 < find(&buf, "older-model").1);
     }
 
     /// Eyeball check: `cargo test screen_snapshot -- --nocapture`.
@@ -660,6 +794,13 @@ mod tests {
         approx.prompt_tokens = 0;
         approx.gen_tokens = 37;
         state.ingest_record(approx);
+        state.ingest_failure(failure(
+            Some("deepseek-v4-pro:cloud"),
+            429,
+            FailureSource::Ollama,
+        ));
+        // A native request: its model is unknown, so the ▸ stays on the last known one.
+        state.ingest_failure(failure(None, 502, FailureSource::Proxy));
         for (w, h) in [(120, 36), (160, 44)] {
             println!(
                 "--- {w}x{h} ---\n{}",

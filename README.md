@@ -6,12 +6,12 @@ A terminal dashboard for [Ollama](https://ollama.com) on macOS and Linux. It sit
 
 ## Features
 
-- **Live request feed**: the latest completed requests (up to 30, as many as fit, newest first) with completion time, model, prompt and generated tokens, time to first token, tokens per second and stop reason. A `~` marks counts that had to be estimated (see [Capture accuracy](#capture-accuracy)).
+- **Live request feed**: the latest requests (up to 30, as many as fit, newest first) with completion time, model, prompt and generated tokens, time to first token, tokens per second and stop reason. A `~` marks counts that had to be estimated (see [Capture accuracy](#capture-accuracy)). A request that fails is a red row: `failed (HTTP 429)` when Ollama (or ollama.com, for a `:cloud` model) answered with an error status, `proxy (HTTP 502)` when the proxy answered itself, usually because Ollama wasn't reachable. Failed requests don't count in the rolling metrics, cost or lifetime totals.
 - **Models**: every installed model, local and `:cloud`, with its type, format, quantization, context length and state, sorted loaded, then cloud, then not-loaded. The panel has room for three rows, so on a machine with many models the loaded ones come first. `▸` marks the model the last request went to.
 - **Rolling metrics**: requests, tokens, mean and p95 tokens per second, and mean time to first token over the last 1, 5 and 15 minutes and the whole session.
 - **Hypothetical cost**: your session's token counts priced at list rates for Claude Fable 5.1, Fable 5, Opus 5.5, Opus 5, Opus 4.8 and Gemini 3.1 Pro.
 - **Hardware**: system CPU and memory, CPU and memory of Ollama's processes (the app, the server and its model runners), and GPU telemetry: GPU active residency and Neural Engine power on macOS, GPU utilization and VRAM in use on Linux with an NVIDIA GPU.
-- **History**: lifetime request and token totals across sessions, kept in a local SQLite database.
+- **History**: lifetime request and token totals across sessions, kept in a local SQLite database along with every failed request's status.
 
 ## How it works
 
@@ -28,7 +28,7 @@ Point your clients at the proxy's port instead of Ollama's. Responses pass throu
 
 It also polls Ollama's `/api/version`, `/api/tags` and `/api/ps` every 2 seconds for the model list. Hardware figures come from [`sysinfo`](https://crates.io/crates/sysinfo) and, for the GPU, from macOS's `powermetrics` (which needs sudo) or Linux's `nvidia-smi` (which doesn't).
 
-**Privacy:** the database stores only per-request metadata (model, token counts, timings), never prompt or response text, and the monitor's log doesn't contain them either. The monitor talks only to the Ollama server you point it at; the cost figures come from a pricing table compiled into the binary.
+**Privacy:** the database stores only per-request metadata (model, token counts, timings, and for a failed request its endpoint and status code), never prompt or response text, and the monitor's log doesn't contain them either. Error messages are response text too: they go to the client and nowhere else. The monitor talks only to the Ollama server you point it at; the cost figures come from a pricing table compiled into the binary.
 
 **Security:** the proxy has no authentication of its own. It also sends its own `Host` header upstream, so Ollama's DNS-rebinding protection (while it listens on localhost, Ollama accepts only local host names) doesn't cover requests that come through the proxy. Ollama's `Origin` (CORS) check still applies.
 
@@ -63,7 +63,7 @@ curl http://localhost:11435/api/chat -d '{"model": "qwen3:14b", "messages": [{"r
 
 On macOS it asks for your sudo password at launch, used only to start `powermetrics` for the GPU and Neural Engine figures. Run it as your normal user, not under `sudo`, so the proxy never runs as root. If sudo fails, those two figures show `n/a` and everything else still works. If the proxy's address is taken or malformed, it exits straight away with the error, before asking for the password. On Linux there is no prompt: `nvidia-smi` runs unprivileged, and without it the GPU figures show `n/a`.
 
-`--no-tui` runs headless instead: one summary line per request on stderr (alongside the log's info lines), still recorded to the database. Headless mode never prompts for sudo and skips the hardware and model polling.
+`--no-tui` runs headless instead: one summary line per completed or failed request on stderr (alongside the log's info lines), still recorded to the database. Headless mode never prompts for sudo and skips the hardware and model polling.
 
 To let other machines or VMs use the proxy, bind it to all interfaces with `--proxy-listen 0.0.0.0:11435`. The proxy has no authentication of its own, so this exposes your Ollama to that network, just as `OLLAMA_HOST=0.0.0.0` would.
 
@@ -94,7 +94,7 @@ Everything that talks to `:11434` then goes through the proxy, the `ollama` CLI 
 |---|---|
 | `q` or `Ctrl-C` | quit |
 | `r` | reset the session: clear the feed, rolling metrics and cost (the database keeps everything) |
-| `p` | pause the feed, rolling metrics, cost and `▸` marker. Requests that arrive while paused are still saved and counted in the lifetime totals, but never enter those panels, even after you resume. The header, models and hardware keep updating |
+| `p` | pause the feed, rolling metrics, cost and `▸` marker. Requests that arrive while paused are still saved (and, if they completed, counted in the lifetime totals), but never enter those panels, even after you resume. The header, models and hardware keep updating |
 
 ## Capture accuracy
 
@@ -106,6 +106,8 @@ Everything that talks to `:11434` then goes through the proxy, the `ollama` CLI 
 | OpenAI-compatible streams that end without a usage chunk: `:cloud` models when Ollama's cloud relay drops it ([ollama/ollama#15169](https://github.com/ollama/ollama/issues/15169)), or a stream cut off early | estimated, marked with `~`: generated tokens are counted from streamed chunks and prompt tokens show as 0, so the cost panel undercounts them. A cut-off stream's stop reason shows `unknown` |
 
 Not recorded: Ollama-native streams that end before their final stats line (when the client disconnects mid-answer, for example), model load and unload calls (an empty prompt or `keep_alive: 0`, like the preload `ollama run` sends), and every other endpoint (embeddings, model management), which simply passes through. A tracked request that ends without usable stats is noted in the log as `no parsable stats in response`.
+
+Failed requests, those answered with a 4xx or 5xx status by Ollama or by the proxy itself, have no stats to record. They're saved to the `failed_requests` table instead and shown as red feed rows, with their status code and, for OpenAI-compatible requests, the model the request asked for. Native requests show `?` as the model, because the proxy passes their bodies through without reading them. An error that arrives after a response has started, inside a stream that began with status 200, isn't counted as a failure: that request is recorded with estimated counts or, like any cut-off stream, not at all.
 
 ## Configuration
 
@@ -140,6 +142,13 @@ sqlite3 ~/Library/Application\ Support/ollama-monitor/usage.db \
   "SELECT model_id, COUNT(*), SUM(prompt_tokens), SUM(gen_tokens) FROM inference_records GROUP BY model_id"
 ```
 
+and failed requests by who answered and with what status:
+
+```sh
+sqlite3 ~/Library/Application\ Support/ollama-monitor/usage.db \
+  "SELECT source, status, COUNT(*) FROM failed_requests GROUP BY source, status"
+```
+
 ## Troubleshooting
 
 | symptom | check |
@@ -148,6 +157,8 @@ sqlite3 ~/Library/Application\ Support/ollama-monitor/usage.db \
 | exits with `invalid --proxy-listen value` | Give an IP and port such as `127.0.0.1:11435`; host names like `localhost` aren't accepted. |
 | header shows `server: ● unreachable` | Is Ollama running (`curl http://localhost:11434/api/version`)? The `err:` text after the status names the call that failed. |
 | no requests appear | Clients are probably still talking to `:11434`; `curl http://localhost:11435/api/version` should answer through the proxy. Also check the header for `[PAUSED]`, and that the client uses an endpoint that's [recorded](#capture-accuracy). |
+| red `failed (HTTP …)` rows | Ollama, or ollama.com for a `:cloud` model, turned the request down; 404, for example, means it doesn't know the model. The error message went to the client, which is where to read it: the monitor keeps only the status. |
+| red `proxy (HTTP …)` rows | The proxy answered the request itself. 502 means it couldn't reach Ollama at `--ollama-url`, and the log says why (`upstream request failed`); 413 means an OpenAI-compatible request body was over the proxy's 64 MiB limit. |
 | "Permission denied" on the log or database at startup | An earlier run under `sudo` left root-owned files. macOS: `sudo chown -R "$USER":staff ~/Library/Application\ Support/ollama-monitor`; Linux: `sudo chown -R "$USER": ~/.local/share/ollama-monitor`. |
 | GPU, ANE or VRAM shows `n/a` | Expected for the first couple of seconds. After that, the log says `powermetrics exited` (macOS) if sudo wasn't available or powermetrics failed, or `spawn nvidia-smi failed` / `nvidia-smi exited` (Linux) if the NVIDIA driver isn't installed. Intel and AMD GPUs aren't read, so layers Ollama places on them (Vulkan, ROCm) don't show in the VRAM figure. Run with `OLLAMA_MONITOR_LOG=ollama_monitor=trace` to see the raw output. |
 | sudo prompt fails (macOS) | Run `sudo -v` first, or use `--no-tui`. |
